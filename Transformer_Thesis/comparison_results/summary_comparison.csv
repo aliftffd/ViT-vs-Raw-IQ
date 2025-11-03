@@ -1,0 +1,5 @@
+Metric,ViT (Vision Transformer),Transformer (Raw IQ),Difference,Improvement (%)
+Overall Accuracy (%),62.02,63.44,1.4199999999999946,2.29
+SNR -8 dB (%),13.44,13.86,0.41999999999999993,3.12
+SNR 0 dB (%),52.31,57.08,4.769999999999996,9.12
+SNR +8 dB (%),96.72,99.19,2.469999999999999,2.55
