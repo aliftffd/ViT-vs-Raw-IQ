@@ -1,12 +1,11 @@
 """
-Raw IQ Signal Visualization Script
+Preprocessing Visualization Script for Paper
 
-This script loads and visualizes raw I/Q signal data from the RadioML 2018 dataset.
-It displays:
-1. Time-domain I and Q channel signals
-2. Constellation diagrams (I vs Q)
-3. Magnitude and phase representations
-4. Signals from different modulation types and SNR levels
+This script visualizes the actual preprocessing pipeline used in:
+1. ViT approach: I/Q data reshaped to 2D images [1, 32, 64]
+2. Transformer approach: I/Q data as raw sequences [2, 1024]
+Both approaches use z-score normalization on I and Q channels separately.
+High-resolution output (600 DPI) for publication quality.
 """
 
 import h5py
@@ -15,7 +14,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import argparse
-from scipy import signal
 
 
 # ============================================
@@ -26,8 +24,8 @@ class Config:
     """Configuration for data visualization"""
 
     # Paths - Update these to match your system
-    FILE_PATH = "C:\\workarea\\Research and Thesis\\dataset\\radioml2018\\versions\\2\\GOLD_XYZ_OSC.0001_1024.hdf5"
-    JSON_PATH = 'C:\\workarea\\Research and Thesis\\dataset\\radioml2018\\versions\\2\\classes-fixed.json'
+    FILE_PATH = "/home/lipplopp/research/AMC_Repository/dataset/GOLD_XYZ_OSC.0001_1024.hdf5"
+    JSON_PATH = '/home/lipplopp/research/AMC_Repository/dataset/classes-fixed.json'
 
     # Output directory
     OUTPUT_DIR = Path("visualization_results")
@@ -36,11 +34,12 @@ class Config:
     NUM_SAMPLES_PER_MOD = 3  # Number of samples to visualize per modulation
     SEQUENCE_LENGTH = 1024
 
-    # DSP settings
-    # NOTE: RadioML 2018.01A uses 1 sample per symbol (no oversampling)
-    # Set to 1 to disable DSP processing and treat each sample as a symbol
-    SAMPLES_PER_SYMBOL = 1  # Samples per symbol (1 = no oversampling, >1 = requires timing recovery)
-    TIMING_METHOD = 'simple_energy'  # Only used if SPS > 1
+    # ViT image dimensions (matches ViT/dataloader/dataset.py)
+    VIT_HEIGHT = 32
+    VIT_WIDTH = 64
+
+    # Output DPI for publication quality
+    OUTPUT_DPI = 600
 
     # Target modulations to visualize
     TARGET_MODULATIONS = [
@@ -67,280 +66,125 @@ class Config:
 
 
 # ============================================
-# DSP UTILITY FUNCTIONS
+# PREPROCESSING FUNCTIONS
 # ============================================
 
-def rrc_filter(alpha, span, sps):
+def calculate_normalization_stats(file_path, indices, num_samples=5000):
     """
-    Generate Root Raised Cosine (RRC) filter
+    Calculate normalization statistics (mean/std) for I/Q channels.
+    This matches the preprocessing in both dataset implementations.
 
     Args:
-        alpha: Roll-off factor (0 to 1)
-        span: Filter span in symbols
-        sps: Samples per symbol
+        file_path: Path to HDF5 file
+        indices: Array of indices to use for calculation
+        num_samples: Number of samples to use for stats calculation
 
     Returns:
-        Normalized RRC filter coefficients
+        Dictionary with i_mean, i_std, q_mean, q_std
     """
-    n = np.arange(-span * sps // 2, span * sps // 2 + 1)
+    with h5py.File(file_path, 'r') as f:
+        X = f['X']
 
-    # Handle special cases
-    h = np.zeros(len(n))
+        # Use subset for efficiency
+        num_samples = min(num_samples, len(indices))
+        np.random.seed(42)
+        sample_indices = np.random.choice(indices, num_samples, replace=False)
 
-    for i, t in enumerate(n):
-        if t == 0:
-            h[i] = (1 + alpha * (4 / np.pi - 1))
-        elif abs(abs(t) - sps / (4 * alpha)) < 1e-10:
-            h[i] = (alpha / np.sqrt(2)) * (
-                (1 + 2 / np.pi) * np.sin(np.pi / (4 * alpha)) +
-                (1 - 2 / np.pi) * np.cos(np.pi / (4 * alpha))
-            )
-        else:
-            numerator = np.sin(np.pi * t / sps * (1 - alpha)) + \
-                       4 * alpha * t / sps * np.cos(np.pi * t / sps * (1 + alpha))
-            denominator = np.pi * t / sps * (1 - (4 * alpha * t / sps) ** 2)
-            h[i] = numerator / denominator
+        # Collect I and Q values
+        i_vals = []
+        q_vals = []
 
-    # Normalize
-    h = h / np.sqrt(np.sum(h ** 2))
-    return h
+        for idx in sample_indices[:1000]:  # Use first 1000 for quick calculation
+            x_raw = X[idx]
+            i_vals.append(x_raw[:, 0])
+            q_vals.append(x_raw[:, 1])
 
+        i_all = np.concatenate(i_vals)
+        q_all = np.concatenate(q_vals)
 
-def matched_filter(i_signal, q_signal, alpha=0.35, span=8, sps=2):
-    """
-    Apply matched filtering to I/Q signals
-
-    Args:
-        i_signal: In-phase component
-        q_signal: Quadrature component
-        alpha: Roll-off factor
-        span: Filter span in symbols
-        sps: Samples per symbol
-
-    Returns:
-        Filtered I and Q signals
-    """
-    rrc = rrc_filter(alpha, span, sps)
-
-    # Apply filter
-    i_filtered = signal.convolve(i_signal, rrc, mode='same')
-    q_filtered = signal.convolve(q_signal, rrc, mode='same')
-
-    return i_filtered, q_filtered
-
-
-def timing_recovery_gardner(i_signal, q_signal, sps=2):
-    """
-    Gardner timing recovery algorithm
-
-    Args:
-        i_signal: In-phase component
-        q_signal: Quadrature component
-        sps: Samples per symbol (initial estimate)
-
-    Returns:
-        Symbol indices (timing instants)
-    """
-    # Combine I and Q into complex signal
-    sig = i_signal + 1j * q_signal
-
-    # Initialize
-    mu = 0  # Fractional delay
-    mu_history = []
-    symbol_indices = []
-
-    # Loop gain
-    K = 0.1
-
-    # Start after some initial samples to avoid edge effects
-    idx = sps
-
-    while idx < len(sig) - sps:
-        # Get samples for timing error calculation
-        if int(idx) >= len(sig) - 1:
-            break
-
-        # Sample at current estimate
-        symbol_indices.append(int(idx))
-
-        # Gardner TED: error = real(mid_sample * conj(prev_symbol - next_symbol))
-        if int(idx - sps/2) >= 0 and int(idx + sps/2) < len(sig):
-            prev_sym = sig[int(idx - sps/2)]
-            mid_sample = sig[int(idx)]
-            next_sym = sig[int(idx + sps/2)]
-
-            # Timing error
-            error = np.real((mid_sample.conjugate() * (next_sym - prev_sym)))
-
-            # Update mu
-            mu = mu + K * error
-            mu_history.append(mu)
-
-        # Advance by sps + mu adjustment
-        idx = idx + sps + mu
-        mu = 0  # Reset mu after applying
-
-    return np.array(symbol_indices)
-
-
-def timing_recovery_mueller_muller(i_signal, q_signal, sps=2):
-    """
-    Mueller and Müller timing recovery algorithm
-
-    Args:
-        i_signal: In-phase component
-        q_signal: Quadrature component
-        sps: Samples per symbol (initial estimate)
-
-    Returns:
-        Symbol indices (timing instants)
-    """
-    # Combine into complex signal
-    sig = i_signal + 1j * q_signal
-
-    # Initialize
-    mu = 0
-    symbol_indices = []
-
-    # Loop parameters
-    K = 0.05  # Timing loop gain
-
-    # Start after initial samples
-    idx = sps
-    prev_symbol = sig[0]
-
-    while idx < len(sig) - sps:
-        if int(idx) >= len(sig):
-            break
-
-        # Sample current symbol
-        current_idx = int(idx)
-        symbol_indices.append(current_idx)
-        current_symbol = sig[current_idx]
-
-        # M&M timing error detector
-        # error = real(current * conj(prev)) - real(prev * conj(current))
-        error = np.real(current_symbol) * np.real(prev_symbol) + \
-                np.imag(current_symbol) * np.imag(prev_symbol)
-
-        # Update timing
-        mu = mu + K * error
-
-        # Advance
-        idx = idx + sps + mu
-        mu = 0
-        prev_symbol = current_symbol
-
-    return np.array(symbol_indices)
-
-
-def simple_timing_recovery(i_signal, q_signal, sps=2, method='energy'):
-    """
-    Simple timing recovery based on signal energy or correlation
-
-    Args:
-        i_signal: In-phase component
-        q_signal: Quadrature component
-        sps: Samples per symbol
-        method: 'energy' or 'correlation'
-
-    Returns:
-        Symbol indices
-    """
-    sig = i_signal + 1j * q_signal
-    energy = np.abs(sig) ** 2
-
-    if method == 'energy':
-        # Find peaks in energy
-        # Use a sliding window to find local maxima
-        window_size = max(1, int(sps * 0.5))
-        peaks = []
-
-        for i in range(window_size, len(energy) - window_size, int(sps)):
-            # Find max in window
-            window = energy[i-window_size:i+window_size]
-            local_max_idx = np.argmax(window)
-            peaks.append(i - window_size + local_max_idx)
-
-        return np.array(peaks)
-
-    else:  # correlation
-        # Simple fixed-rate sampling with offset estimation
-        # Find best offset by maximizing energy
-        best_offset = 0
-        best_energy = 0
-
-        for offset in range(sps):
-            indices = np.arange(offset, len(sig), sps)
-            total_energy = np.sum(energy[indices])
-            if total_energy > best_energy:
-                best_energy = total_energy
-                best_offset = offset
-
-        return np.arange(best_offset, len(sig), sps)
-
-
-def extract_symbols(i_signal, q_signal, sps=1, method='gardner', alpha=0.35):
-    """
-    Extract symbol decision points from raw I/Q waveform
-
-    Args:
-        i_signal: In-phase component
-        q_signal: Quadrature component
-        sps: Samples per symbol (1 = no oversampling, >1 = requires timing recovery)
-        method: 'gardner', 'mueller_muller', 'simple_energy', 'simple_correlation'
-        alpha: RRC roll-off factor for matched filtering
-
-    Returns:
-        Dictionary containing:
-            - symbol_i: I values at decision points
-            - symbol_q: Q values at decision points
-            - symbol_indices: Timing indices
-            - filtered_i: Matched filtered I signal (same as input for sps=1)
-            - filtered_q: Matched filtered Q signal (same as input for sps=1)
-    """
-    # Special case: sps=1 means data is already at symbol rate
-    # No DSP processing needed - every sample IS a symbol
-    if sps == 1:
-        symbol_indices = np.arange(len(i_signal))
-        return {
-            'symbol_i': i_signal.copy(),
-            'symbol_q': q_signal.copy(),
-            'symbol_indices': symbol_indices,
-            'filtered_i': i_signal.copy(),
-            'filtered_q': q_signal.copy()
+        stats = {
+            'i_mean': np.mean(i_all),
+            'i_std': max(np.std(i_all), 1e-8),
+            'q_mean': np.mean(q_all),
+            'q_std': max(np.std(q_all), 1e-8)
         }
 
-    # For sps > 1: Apply DSP processing
-    # Apply matched filtering
-    i_filtered, q_filtered = matched_filter(i_signal, q_signal, alpha=alpha, sps=sps)
+        return stats
 
-    # Timing recovery
-    if method == 'gardner':
-        symbol_indices = timing_recovery_gardner(i_filtered, q_filtered, sps=sps)
-    elif method == 'mueller_muller':
-        symbol_indices = timing_recovery_mueller_muller(i_filtered, q_filtered, sps=sps)
-    elif method == 'simple_energy':
-        symbol_indices = simple_timing_recovery(i_filtered, q_filtered, sps=sps, method='energy')
-    elif method == 'simple_correlation':
-        symbol_indices = simple_timing_recovery(i_filtered, q_filtered, sps=sps, method='correlation')
-    else:
-        raise ValueError(f"Unknown timing recovery method: {method}")
 
-    # Clip indices to valid range
-    symbol_indices = symbol_indices[symbol_indices < len(i_filtered)]
+def apply_normalization(i_signal, q_signal, stats):
+    """
+    Apply z-score normalization to I/Q signals.
+    Matches the preprocessing in dataset.__getitem__()
 
-    # Extract symbols at decision points
-    symbol_i = i_filtered[symbol_indices]
-    symbol_q = q_filtered[symbol_indices]
+    Args:
+        i_signal: In-phase signal
+        q_signal: Quadrature signal
+        stats: Dictionary with i_mean, i_std, q_mean, q_std
 
-    return {
-        'symbol_i': symbol_i,
-        'symbol_q': symbol_q,
-        'symbol_indices': symbol_indices,
-        'filtered_i': i_filtered,
-        'filtered_q': q_filtered
-    }
+    Returns:
+        Normalized I and Q signals
+    """
+    i_normalized = (i_signal - stats['i_mean']) / stats['i_std']
+    q_normalized = (q_signal - stats['q_mean']) / stats['q_std']
+    return i_normalized, q_normalized
+
+
+def preprocess_for_vit(i_signal, q_signal, stats, H=32, W=64):
+    """
+    Preprocess I/Q data for ViT approach.
+    Matches ViT/dataloader/dataset.py __getitem__() method.
+
+    Steps:
+    1. Normalize I and Q channels
+    2. Concatenate [I, Q] to form [2048] vector
+    3. Reshape to [1, 32, 64] image
+
+    Args:
+        i_signal: In-phase signal [1024]
+        q_signal: Quadrature signal [1024]
+        stats: Normalization statistics
+        H, W: Image height and width
+
+    Returns:
+        Image array [1, H, W]
+    """
+    # Normalize
+    i_norm, q_norm = apply_normalization(i_signal, q_signal, stats)
+
+    # Concatenate I and Q to form [2048] vector
+    iq_concat = np.concatenate([i_norm, q_norm])
+
+    # Reshape to [1, H, W] image
+    iq_image = iq_concat.reshape(1, H, W)
+
+    return iq_image
+
+
+def preprocess_for_transformer(i_signal, q_signal, stats):
+    """
+    Preprocess I/Q data for Transformer approach.
+    Matches transformer_rawIQ/dataloader/dataset.py __getitem__() method.
+
+    Steps:
+    1. Normalize I and Q channels
+    2. Stack to [2, sequence_length] format
+
+    Args:
+        i_signal: In-phase signal [1024]
+        q_signal: Quadrature signal [1024]
+        stats: Normalization statistics
+
+    Returns:
+        Stacked array [2, 1024]
+    """
+    # Normalize
+    i_norm, q_norm = apply_normalization(i_signal, q_signal, stats)
+
+    # Stack to [2, sequence_length]
+    iq_data = np.stack([i_norm, q_norm], axis=0)
+
+    return iq_data
 
 
 def load_dataset_info(file_path, json_path):
@@ -395,177 +239,159 @@ def load_dataset_info(file_path, json_path):
     }
 
 
-def plot_iq_signal(i_signal, q_signal, title, save_path=None, sps=1, timing_method='simple_energy'):
+def plot_preprocessing_pipeline(i_signal, q_signal, stats, title, save_path, config):
     """
-    Plot I/Q signal in multiple representations with proper DSP processing
+    Visualize the complete preprocessing pipeline for both ViT and Transformer approaches.
 
     Args:
-        i_signal: In-phase component (numpy array)
-        q_signal: Quadrature component (numpy array)
+        i_signal: Raw in-phase signal [1024]
+        q_signal: Raw quadrature signal [1024]
+        stats: Normalization statistics
         title: Plot title
-        save_path: Path to save the figure (optional)
-        sps: Samples per symbol (1 = no oversampling, >1 = requires timing recovery)
-        timing_method: Timing recovery method (only used if sps > 1)
+        save_path: Path to save the figure
+        config: Configuration object
     """
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    # Apply preprocessing
+    i_norm, q_norm = apply_normalization(i_signal, q_signal, stats)
+    vit_image = preprocess_for_vit(i_signal, q_signal, stats, config.VIT_HEIGHT, config.VIT_WIDTH)
+    transformer_data = preprocess_for_transformer(i_signal, q_signal, stats)
 
-    # Update title based on SPS
-    if sps == 1:
-        full_title = f"{title}\n(1 sample/symbol - No DSP processing)"
-    else:
-        full_title = f"{title}\n(DSP: {sps} samples/symbol, {timing_method})"
+    # Create figure with better layout for paper
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(3, 4, hspace=0.3, wspace=0.3)
 
-    fig.suptitle(full_title, fontsize=16, fontweight='bold')
+    fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
 
     # Time axis
     time_axis = np.arange(len(i_signal))
 
-    # Extract symbols using DSP processing
-    try:
-        symbols = extract_symbols(i_signal, q_signal, sps=sps, method=timing_method)
-        dsp_success = len(symbols['symbol_i']) > 0
-    except Exception as e:
-        print(f"  Warning: Symbol extraction failed ({e}), showing raw signals only")
-        dsp_success = False
+    # Row 1: Raw signals
+    # 1a. Raw I/Q time series
+    ax1 = fig.add_subplot(gs[0, 0:2])
+    ax1.plot(time_axis, i_signal, label='I (In-phase)', alpha=0.8, linewidth=1, color='#1f77b4')
+    ax1.plot(time_axis, q_signal, label='Q (Quadrature)', alpha=0.8, linewidth=1, color='#ff7f0e')
+    ax1.set_xlabel('Sample Index', fontsize=10)
+    ax1.set_ylabel('Amplitude', fontsize=10)
+    ax1.set_title('(a) Raw I/Q Signal', fontsize=11, fontweight='bold')
+    ax1.legend(fontsize=9, loc='upper right')
+    ax1.grid(True, alpha=0.3, linewidth=0.5)
 
-    # 1. Time domain - Raw I and Q signals
-    ax1 = axes[0, 0]
-    ax1.plot(time_axis, i_signal, label='I (In-phase)', alpha=0.7, linewidth=0.8, color='blue')
-    ax1.plot(time_axis, q_signal, label='Q (Quadrature)', alpha=0.7, linewidth=0.8, color='orange')
-    if dsp_success:
-        # Mark symbol decision points
-        ax1.scatter(symbols['symbol_indices'], symbols['symbol_i'],
-                   color='blue', s=20, marker='o', zorder=5, label='I symbols', edgecolors='black', linewidths=0.5)
-        ax1.scatter(symbols['symbol_indices'], symbols['symbol_q'],
-                   color='orange', s=20, marker='o', zorder=5, label='Q symbols', edgecolors='black', linewidths=0.5)
-    ax1.set_xlabel('Sample Index')
-    ax1.set_ylabel('Amplitude')
-    ax1.set_title('Time Domain - Raw I/Q Signals')
-    ax1.legend(fontsize=8)
-    ax1.grid(True, alpha=0.3)
-
-    # 2. Constellation diagram - Raw trajectory (all samples)
-    ax2 = axes[0, 1]
-    if sps == 1:
-        # For sps=1, all samples are symbols - show differently
-        ax2.scatter(i_signal, q_signal, alpha=0.4, s=8, color='blue',
-                   edgecolors='darkblue', linewidths=0.3, label=f'All samples (n={len(i_signal)})')
-        ax2.set_title('Constellation - All Samples\n(Each sample is a symbol)')
-    else:
-        ax2.scatter(i_signal, q_signal, alpha=0.2, s=3, color='gray', label='Raw trajectory')
-        ax2.set_title('Constellation - Raw Trajectory\n(includes inter-symbol transitions)')
-    ax2.set_xlabel('I (In-phase)')
-    ax2.set_ylabel('Q (Quadrature)')
-    ax2.grid(True, alpha=0.3)
+    # 1b. Raw constellation
+    ax2 = fig.add_subplot(gs[0, 2])
+    ax2.scatter(i_signal, q_signal, alpha=0.5, s=10, color='#1f77b4', edgecolors='none')
+    ax2.set_xlabel('I (In-phase)', fontsize=10)
+    ax2.set_ylabel('Q (Quadrature)', fontsize=10)
+    ax2.set_title('(b) Raw Constellation', fontsize=11, fontweight='bold')
+    ax2.grid(True, alpha=0.3, linewidth=0.5)
     ax2.axhline(y=0, color='k', linewidth=0.5)
     ax2.axvline(x=0, color='k', linewidth=0.5)
     ax2.axis('equal')
-    ax2.legend(fontsize=8)
 
-    # 3. Constellation diagram - Recovered/extracted symbols
-    ax3 = axes[0, 2]
-    if dsp_success:
-        if sps == 1:
-            # Same as raw for sps=1
-            ax3.scatter(symbols['symbol_i'], symbols['symbol_q'],
-                       alpha=0.6, s=15, color='red', marker='o',
-                       edgecolors='darkred', linewidths=0.5, label=f'Symbols (n={len(symbols["symbol_i"])})')
-            ax3.set_title('Constellation - Symbol Points\n(No processing needed for 1 SPS)')
-        else:
-            ax3.scatter(symbols['symbol_i'], symbols['symbol_q'],
-                       alpha=0.6, s=15, color='red', marker='o',
-                       edgecolors='darkred', linewidths=0.5, label=f'Recovered (n={len(symbols["symbol_i"])})')
-            ax3.set_title(f'Constellation - Recovered Symbols\n(Method: {timing_method})')
-    else:
-        ax3.text(0.5, 0.5, 'Symbol extraction\nfailed',
-                ha='center', va='center', transform=ax3.transAxes, fontsize=12)
-        ax3.set_title('Constellation - Symbol Points')
-    ax3.set_xlabel('I (In-phase)')
-    ax3.set_ylabel('Q (Quadrature)')
-    ax3.grid(True, alpha=0.3)
-    ax3.axhline(y=0, color='k', linewidth=0.5)
-    ax3.axvline(x=0, color='k', linewidth=0.5)
-    ax3.axis('equal')
-    if dsp_success:
-        ax3.legend(fontsize=8)
+    # 1c. Signal statistics
+    ax3 = fig.add_subplot(gs[0, 3])
+    ax3.axis('off')
+    stats_text = (
+        f"Raw Statistics:\n"
+        f"I mean: {np.mean(i_signal):.4f}\n"
+        f"I std: {np.std(i_signal):.4f}\n"
+        f"Q mean: {np.mean(q_signal):.4f}\n"
+        f"Q std: {np.std(q_signal):.4f}\n\n"
+        f"Normalization:\n"
+        f"I: (x - {stats['i_mean']:.4f}) / {stats['i_std']:.4f}\n"
+        f"Q: (x - {stats['q_mean']:.4f}) / {stats['q_std']:.4f}"
+    )
+    ax3.text(0.1, 0.5, stats_text, fontsize=9, verticalalignment='center',
+             family='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+    ax3.set_title('(c) Preprocessing Stats', fontsize=11, fontweight='bold')
 
-    # 4. Magnitude over time
-    ax4 = axes[1, 0]
-    magnitude = np.sqrt(i_signal**2 + q_signal**2)
-    ax4.plot(time_axis, magnitude, color='purple', linewidth=0.8, alpha=0.7, label='Raw magnitude')
-    if dsp_success:
-        filtered_magnitude = np.sqrt(symbols['filtered_i']**2 + symbols['filtered_q']**2)
-        ax4.plot(time_axis, filtered_magnitude, color='green', linewidth=0.8, alpha=0.7, label='Filtered magnitude')
-        ax4.scatter(symbols['symbol_indices'], filtered_magnitude[symbols['symbol_indices']],
-                   color='red', s=15, marker='o', zorder=5, label='Symbol timing', edgecolors='darkred', linewidths=0.5)
-    ax4.set_xlabel('Sample Index')
-    ax4.set_ylabel('Magnitude')
-    ax4.set_title('Signal Magnitude')
-    ax4.legend(fontsize=8)
-    ax4.grid(True, alpha=0.3)
+    # Row 2: Normalized signals
+    # 2a. Normalized I/Q time series
+    ax4 = fig.add_subplot(gs[1, 0:2])
+    ax4.plot(time_axis, i_norm, label='I normalized', alpha=0.8, linewidth=1, color='#2ca02c')
+    ax4.plot(time_axis, q_norm, label='Q normalized', alpha=0.8, linewidth=1, color='#d62728')
+    ax4.set_xlabel('Sample Index', fontsize=10)
+    ax4.set_ylabel('Normalized Amplitude', fontsize=10)
+    ax4.set_title('(d) Normalized I/Q Signal (Common to both approaches)', fontsize=11, fontweight='bold')
+    ax4.legend(fontsize=9, loc='upper right')
+    ax4.grid(True, alpha=0.3, linewidth=0.5)
 
-    # 5. Phase over time
-    ax5 = axes[1, 1]
-    phase = np.arctan2(q_signal, i_signal)
-    ax5.plot(time_axis, phase, color='orange', linewidth=0.8, alpha=0.7, label='Raw phase')
-    if dsp_success:
-        filtered_phase = np.arctan2(symbols['filtered_q'], symbols['filtered_i'])
-        ax5.plot(time_axis, filtered_phase, color='brown', linewidth=0.8, alpha=0.7, label='Filtered phase')
-        ax5.scatter(symbols['symbol_indices'], filtered_phase[symbols['symbol_indices']],
-                   color='red', s=15, marker='o', zorder=5, label='Symbol timing', edgecolors='darkred', linewidths=0.5)
-    ax5.set_xlabel('Sample Index')
-    ax5.set_ylabel('Phase (radians)')
-    ax5.set_title('Signal Phase')
-    ax5.legend(fontsize=8)
-    ax5.grid(True, alpha=0.3)
+    # 2b. Normalized constellation
+    ax5 = fig.add_subplot(gs[1, 2])
+    ax5.scatter(i_norm, q_norm, alpha=0.5, s=10, color='#2ca02c', edgecolors='none')
+    ax5.set_xlabel('I (normalized)', fontsize=10)
+    ax5.set_ylabel('Q (normalized)', fontsize=10)
+    ax5.set_title('(e) Normalized Constellation', fontsize=11, fontweight='bold')
+    ax5.grid(True, alpha=0.3, linewidth=0.5)
     ax5.axhline(y=0, color='k', linewidth=0.5)
+    ax5.axvline(x=0, color='k', linewidth=0.5)
+    ax5.axis('equal')
 
-    # 6. Eye diagram (if DSP successful)
-    ax6 = axes[1, 2]
-    if dsp_success and sps > 1:
-        # Create eye diagram
-        eye_period = sps * 2  # Show 2 symbol periods
-        i_filt = symbols['filtered_i']
+    # 2c. Normalized statistics
+    ax6 = fig.add_subplot(gs[1, 3])
+    ax6.axis('off')
+    norm_stats_text = (
+        f"Normalized Statistics:\n"
+        f"I mean: {np.mean(i_norm):.4f}\n"
+        f"I std: {np.std(i_norm):.4f}\n"
+        f"Q mean: {np.mean(q_norm):.4f}\n"
+        f"Q std: {np.std(q_norm):.4f}\n\n"
+        f"Shape: [1024, 2]\n"
+        f"(1024 samples, 2 channels)"
+    )
+    ax6.text(0.1, 0.5, norm_stats_text, fontsize=9, verticalalignment='center',
+             family='monospace', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
+    ax6.set_title('(f) Normalized Stats', fontsize=11, fontweight='bold')
 
-        # Overlay multiple traces
-        for start_idx in range(0, len(i_filt) - eye_period, sps):
-            segment = i_filt[start_idx:start_idx + eye_period]
-            if len(segment) == eye_period:
-                ax6.plot(range(eye_period), segment, alpha=0.1, color='blue', linewidth=0.5)
+    # Row 3: Final representations
+    # 3a. ViT: 2D image representation
+    ax7 = fig.add_subplot(gs[2, 0:2])
+    im = ax7.imshow(vit_image[0], aspect='auto', cmap='viridis', interpolation='nearest')
+    ax7.set_xlabel('Width (64)', fontsize=10)
+    ax7.set_ylabel('Height (32)', fontsize=10)
+    ax7.set_title('(g) ViT Approach: Reshaped to 2D Image [1, 32, 64]', fontsize=11, fontweight='bold')
+    cbar = plt.colorbar(im, ax=ax7, fraction=0.046, pad=0.04)
+    cbar.set_label('Normalized Amplitude', fontsize=9)
+    # Add annotation
+    ax7.text(0.5, -0.15, 'Concatenate [I, Q] → [2048] → Reshape to [1, 32, 64]',
+             transform=ax7.transAxes, ha='center', fontsize=9,
+             bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.3))
 
-        ax6.set_xlabel('Samples (2 symbol periods)')
-        ax6.set_ylabel('Amplitude')
-        ax6.set_title('Eye Diagram (I channel)')
-        ax6.grid(True, alpha=0.3)
-        ax6.axvline(x=sps, color='red', linewidth=1, linestyle='--', label='Symbol boundary')
-        ax6.legend(fontsize=8)
-    else:
-        ax6.text(0.5, 0.5, 'Eye diagram\nnot available',
-                ha='center', va='center', transform=ax6.transAxes, fontsize=12)
-        ax6.set_title('Eye Diagram')
+    # 3b. Transformer: Sequence representation
+    ax8 = fig.add_subplot(gs[2, 2:4])
+    # Show both channels as separate lines
+    ax8.plot(time_axis, transformer_data[0], label='I channel', alpha=0.8, linewidth=1, color='#9467bd')
+    ax8.plot(time_axis, transformer_data[1], label='Q channel', alpha=0.8, linewidth=1, color='#8c564b')
+    ax8.set_xlabel('Sequence Position', fontsize=10)
+    ax8.set_ylabel('Normalized Amplitude', fontsize=10)
+    ax8.set_title('(h) Transformer Approach: Raw Sequence [2, 1024]', fontsize=11, fontweight='bold')
+    ax8.legend(fontsize=9, loc='upper right')
+    ax8.grid(True, alpha=0.3, linewidth=0.5)
+    # Add annotation
+    ax8.text(0.5, -0.15, 'Stack [I, Q] → [2, 1024] (2 channels, 1024 time steps)',
+             transform=ax8.transAxes, ha='center', fontsize=9,
+             bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.3))
 
     plt.tight_layout()
 
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  ✅ Saved: {save_path}")
+        plt.savefig(save_path, dpi=config.OUTPUT_DPI, bbox_inches='tight')
+        print(f"  ✅ Saved: {save_path} (DPI={config.OUTPUT_DPI})")
 
     plt.close()
 
 
-def visualize_modulation_samples(file_path, dataset_info, modulation, config, num_samples=3, snr_value=None, sps=2, timing_method='simple_energy'):
+def visualize_modulation_samples(file_path, dataset_info, modulation, config, stats, num_samples=3, snr_value=None):
     """
-    Visualize samples for a specific modulation type
+    Visualize preprocessing pipeline for samples of a specific modulation type
 
     Args:
         file_path: Path to HDF5 file
         dataset_info: Dictionary containing dataset metadata
         modulation: Modulation type to visualize
         config: Configuration object
+        stats: Normalization statistics
         num_samples: Number of samples to visualize
         snr_value: Specific SNR value to filter (optional, uses highest if None)
-        sps: Samples per symbol
-        timing_method: Timing recovery method
     """
     Y_strings = dataset_info['Y_strings']
     Z = dataset_info['Z']
@@ -613,162 +439,26 @@ def visualize_modulation_samples(file_path, dataset_info, modulation, config, nu
             actual_snr = Z[idx]
 
             # Create plot
-            title = f"{modulation} - Sample {i+1} (SNR={actual_snr:.1f}dB)"
-            save_path = mod_dir / f"{modulation}_sample_{i+1}_snr{int(actual_snr)}.png"
+            title = f"{modulation} - Preprocessing Pipeline (SNR={actual_snr:.1f}dB)"
+            save_path = mod_dir / f"{modulation}_preprocessing_sample_{i+1}_snr{int(actual_snr)}.png"
 
-            plot_iq_signal(i_signal, q_signal, title, save_path, sps=sps, timing_method=timing_method)
+            plot_preprocessing_pipeline(i_signal, q_signal, stats, title, save_path, config)
 
 
-def visualize_snr_comparison(file_path, dataset_info, modulation, config, snr_values=None, sps=1, timing_method='simple_energy'):
+def create_overview_plot(file_path, dataset_info, config, stats):
     """
-    Visualize the same modulation type at different SNR levels
-
-    Args:
-        file_path: Path to HDF5 file
-        dataset_info: Dictionary containing dataset metadata
-        modulation: Modulation type to visualize
-        config: Configuration object
-        snr_values: List of SNR values to compare (optional)
-        sps: Samples per symbol (1 = no oversampling)
-        timing_method: Timing recovery method (only used if sps > 1)
-    """
-    if snr_values is None:
-        # Select low, medium, and high SNR
-        unique_snr = dataset_info['unique_snr']
-        snr_values = [unique_snr.min(), unique_snr[len(unique_snr)//2], unique_snr.max()]
-
-    Y_strings = dataset_info['Y_strings']
-    Z = dataset_info['Z']
-
-    print(f"\n📊 SNR Comparison for {modulation}")
-
-    # Create comparison directory
-    comp_dir = config.OUTPUT_DIR / "snr_comparison"
-    comp_dir.mkdir(parents=True, exist_ok=True)
-
-    with h5py.File(file_path, 'r') as f:
-        X = f['X']
-
-        fig, axes = plt.subplots(len(snr_values), 4, figsize=(20, 4*len(snr_values)))
-        if len(snr_values) == 1:
-            axes = axes.reshape(1, -1)
-
-        if sps == 1:
-            title_suffix = '(1 sample/symbol - No DSP)'
-        else:
-            title_suffix = f'(DSP: {sps} SPS, {timing_method})'
-        fig.suptitle(f'{modulation} - SNR Comparison {title_suffix}', fontsize=16, fontweight='bold')
-
-        for row, snr in enumerate(snr_values):
-            # Find sample at this SNR
-            mod_indices = np.where(Y_strings == modulation)[0]
-            snr_mask = np.abs(Z[mod_indices] - snr) < 0.1
-            filtered_indices = mod_indices[snr_mask]
-
-            if len(filtered_indices) == 0:
-                print(f"  ⚠️  No samples found at SNR={snr}dB")
-                continue
-
-            # Get one sample
-            idx = filtered_indices[0]
-            x_raw = X[idx]
-
-            i_signal = x_raw[:, 0]
-            q_signal = x_raw[:, 1]
-            time_axis = np.arange(len(i_signal))
-
-            # Extract symbols
-            try:
-                symbols = extract_symbols(i_signal, q_signal, sps=sps, method=timing_method)
-                dsp_success = len(symbols['symbol_i']) > 0
-            except:
-                dsp_success = False
-
-            # Plot I/Q time series
-            axes[row, 0].plot(time_axis, i_signal, label='I', alpha=0.7, linewidth=0.8, color='blue')
-            axes[row, 0].plot(time_axis, q_signal, label='Q', alpha=0.7, linewidth=0.8, color='orange')
-            if dsp_success:
-                axes[row, 0].scatter(symbols['symbol_indices'], symbols['symbol_i'],
-                                    color='blue', s=15, marker='o', zorder=5, edgecolors='black', linewidths=0.5)
-                axes[row, 0].scatter(symbols['symbol_indices'], symbols['symbol_q'],
-                                    color='orange', s=15, marker='o', zorder=5, edgecolors='black', linewidths=0.5)
-            axes[row, 0].set_ylabel(f'SNR={snr:.1f}dB', fontsize=12, fontweight='bold')
-            axes[row, 0].legend(fontsize=8)
-            axes[row, 0].grid(True, alpha=0.3)
-            if row == 0:
-                axes[row, 0].set_title('Time Domain')
-            if row == len(snr_values) - 1:
-                axes[row, 0].set_xlabel('Sample Index')
-
-            # Plot constellation
-            if sps == 1:
-                axes[row, 1].scatter(i_signal, q_signal, alpha=0.4, s=8, color='blue',
-                                    edgecolors='darkblue', linewidths=0.3)
-            else:
-                axes[row, 1].scatter(i_signal, q_signal, alpha=0.2, s=3, color='gray')
-            axes[row, 1].axhline(y=0, color='k', linewidth=0.5)
-            axes[row, 1].axvline(x=0, color='k', linewidth=0.5)
-            axes[row, 1].grid(True, alpha=0.3)
-            axes[row, 1].axis('equal')
-            if row == 0:
-                axes[row, 1].set_title('Constellation (All Samples)' if sps == 1 else 'Raw Trajectory')
-            if row == len(snr_values) - 1:
-                axes[row, 1].set_xlabel('I (In-phase)')
-            axes[row, 1].set_ylabel('Q (Quadrature)')
-
-            # Plot symbols (same as all samples for sps=1)
-            if dsp_success:
-                axes[row, 2].scatter(symbols['symbol_i'], symbols['symbol_q'],
-                                    alpha=0.6, s=15, color='red', marker='o',
-                                    edgecolors='darkred', linewidths=0.5)
-            axes[row, 2].axhline(y=0, color='k', linewidth=0.5)
-            axes[row, 2].axvline(x=0, color='k', linewidth=0.5)
-            axes[row, 2].grid(True, alpha=0.3)
-            axes[row, 2].axis('equal')
-            if row == 0:
-                axes[row, 2].set_title('Symbol Points' if sps == 1 else 'Recovered Symbols')
-            if row == len(snr_values) - 1:
-                axes[row, 2].set_xlabel('I (In-phase)')
-            axes[row, 2].set_ylabel('Q (Quadrature)')
-
-            # Plot magnitude
-            magnitude = np.sqrt(i_signal**2 + q_signal**2)
-            axes[row, 3].plot(time_axis, magnitude, color='purple', linewidth=0.8, alpha=0.7, label='Raw')
-            if dsp_success:
-                filtered_magnitude = np.sqrt(symbols['filtered_i']**2 + symbols['filtered_q']**2)
-                axes[row, 3].plot(time_axis, filtered_magnitude, color='green', linewidth=0.8, alpha=0.7, label='Filtered')
-                axes[row, 3].scatter(symbols['symbol_indices'], filtered_magnitude[symbols['symbol_indices']],
-                                    color='red', s=10, marker='o', zorder=5, edgecolors='darkred', linewidths=0.5)
-            axes[row, 3].grid(True, alpha=0.3)
-            axes[row, 3].legend(fontsize=8)
-            if row == 0:
-                axes[row, 3].set_title('Magnitude')
-            if row == len(snr_values) - 1:
-                axes[row, 3].set_xlabel('Sample Index')
-            axes[row, 3].set_ylabel('Magnitude')
-
-        plt.tight_layout()
-        save_path = comp_dir / f"{modulation}_snr_comparison.png"
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  ✅ Saved: {save_path}")
-        plt.close()
-
-
-def create_overview_plot(file_path, dataset_info, config, sps=1, timing_method='simple_energy'):
-    """
-    Create an overview plot showing multiple modulation types
+    Create an overview showing preprocessing for multiple modulation types
 
     Args:
         file_path: Path to HDF5 file
         dataset_info: Dictionary containing dataset metadata
         config: Configuration object
-        sps: Samples per symbol (1 = no oversampling)
-        timing_method: Timing recovery method (only used if sps > 1)
+        stats: Normalization statistics
     """
-    print(f"\n📊 Creating overview plot")
+    print(f"\n📊 Creating modulation overview")
 
     # Select a subset of modulations for overview
-    overview_mods = ['BPSK', 'QPSK', '8PSK', '16QAM', '64QAM', 'GMSK']
+    overview_mods = ['BPSK', 'QPSK', '8PSK', '16QAM', '64QAM']
     available_mods = [m for m in overview_mods if m in config.TARGET_MODULATIONS]
 
     if len(available_mods) == 0:
@@ -784,15 +474,11 @@ def create_overview_plot(file_path, dataset_info, config, sps=1, timing_method='
     with h5py.File(file_path, 'r') as f:
         X = f['X']
 
-        fig, axes = plt.subplots(len(available_mods), 3, figsize=(18, 3*len(available_mods)))
-        if len(available_mods) == 1:
-            axes = axes.reshape(1, -1)
+        fig = plt.figure(figsize=(18, 3*len(available_mods)))
+        gs = fig.add_gridspec(len(available_mods), 4, hspace=0.3, wspace=0.3)
 
-        if sps == 1:
-            title_suffix = '1 sample/symbol'
-        else:
-            title_suffix = f'DSP: {sps} SPS, {timing_method}'
-        fig.suptitle(f'Modulation Overview (SNR={snr_value:.1f}dB) - {title_suffix}', fontsize=16, fontweight='bold')
+        fig.suptitle(f'Preprocessing Overview - Multiple Modulations (SNR={snr_value:.1f}dB)',
+                     fontsize=14, fontweight='bold')
 
         for row, mod in enumerate(available_mods):
             # Find sample
@@ -810,83 +496,72 @@ def create_overview_plot(file_path, dataset_info, config, sps=1, timing_method='
             q_signal = x_raw[:, 1]
             time_axis = np.arange(len(i_signal))
 
-            # Extract symbols
-            try:
-                symbols = extract_symbols(i_signal, q_signal, sps=sps, method=timing_method)
-                dsp_success = len(symbols['symbol_i']) > 0
-            except:
-                dsp_success = False
+            # Apply preprocessing
+            i_norm, q_norm = apply_normalization(i_signal, q_signal, stats)
+            vit_image = preprocess_for_vit(i_signal, q_signal, stats, config.VIT_HEIGHT, config.VIT_WIDTH)
 
-            # Time domain
-            axes[row, 0].plot(time_axis, i_signal, label='I', alpha=0.7, linewidth=0.8, color='blue')
-            axes[row, 0].plot(time_axis, q_signal, label='Q', alpha=0.7, linewidth=0.8, color='orange')
-            if dsp_success:
-                axes[row, 0].scatter(symbols['symbol_indices'], symbols['symbol_i'],
-                                    color='blue', s=10, marker='o', zorder=5, edgecolors='black', linewidths=0.5)
-                axes[row, 0].scatter(symbols['symbol_indices'], symbols['symbol_q'],
-                                    color='orange', s=10, marker='o', zorder=5, edgecolors='black', linewidths=0.5)
-            axes[row, 0].set_ylabel(mod, fontsize=12, fontweight='bold')
-            axes[row, 0].legend(fontsize=8)
-            axes[row, 0].grid(True, alpha=0.3)
+            # Column 0: Raw I/Q
+            ax0 = fig.add_subplot(gs[row, 0])
+            ax0.plot(time_axis, i_signal, alpha=0.7, linewidth=0.8, color='blue')
+            ax0.plot(time_axis, q_signal, alpha=0.7, linewidth=0.8, color='orange')
+            ax0.set_ylabel(mod, fontsize=11, fontweight='bold')
+            ax0.grid(True, alpha=0.3)
             if row == 0:
-                axes[row, 0].set_title('Time Domain')
+                ax0.set_title('Raw I/Q', fontsize=10, fontweight='bold')
             if row == len(available_mods) - 1:
-                axes[row, 0].set_xlabel('Sample Index')
+                ax0.set_xlabel('Sample', fontsize=9)
 
-            # Constellation
-            if sps == 1:
-                axes[row, 1].scatter(i_signal, q_signal, alpha=0.4, s=8, color='blue',
-                                    edgecolors='darkblue', linewidths=0.3)
-            else:
-                axes[row, 1].scatter(i_signal, q_signal, alpha=0.2, s=3, color='gray')
-            axes[row, 1].axhline(y=0, color='k', linewidth=0.5)
-            axes[row, 1].axvline(x=0, color='k', linewidth=0.5)
-            axes[row, 1].grid(True, alpha=0.3)
-            axes[row, 1].axis('equal')
+            # Column 1: Raw constellation
+            ax1 = fig.add_subplot(gs[row, 1])
+            ax1.scatter(i_signal, q_signal, alpha=0.5, s=8, color='blue', edgecolors='none')
+            ax1.axhline(y=0, color='k', linewidth=0.5)
+            ax1.axvline(x=0, color='k', linewidth=0.5)
+            ax1.grid(True, alpha=0.3)
+            ax1.axis('equal')
             if row == 0:
-                axes[row, 1].set_title('Constellation (All Samples)' if sps == 1 else 'Raw Trajectory')
+                ax1.set_title('Raw Constellation', fontsize=10, fontweight='bold')
             if row == len(available_mods) - 1:
-                axes[row, 1].set_xlabel('I (In-phase)')
-            axes[row, 1].set_ylabel('Q (Quadrature)')
+                ax1.set_xlabel('I', fontsize=9)
 
-            # Symbols
-            if dsp_success:
-                axes[row, 2].scatter(symbols['symbol_i'], symbols['symbol_q'],
-                                    alpha=0.6, s=15, color='red', marker='o',
-                                    edgecolors='darkred', linewidths=0.5)
-            axes[row, 2].axhline(y=0, color='k', linewidth=0.5)
-            axes[row, 2].axvline(x=0, color='k', linewidth=0.5)
-            axes[row, 2].grid(True, alpha=0.3)
-            axes[row, 2].axis('equal')
+            # Column 2: Normalized constellation
+            ax2 = fig.add_subplot(gs[row, 2])
+            ax2.scatter(i_norm, q_norm, alpha=0.5, s=8, color='green', edgecolors='none')
+            ax2.axhline(y=0, color='k', linewidth=0.5)
+            ax2.axvline(x=0, color='k', linewidth=0.5)
+            ax2.grid(True, alpha=0.3)
+            ax2.axis('equal')
             if row == 0:
-                axes[row, 2].set_title('Symbol Points' if sps == 1 else 'Recovered Symbols')
+                ax2.set_title('Normalized', fontsize=10, fontweight='bold')
             if row == len(available_mods) - 1:
-                axes[row, 2].set_xlabel('I (In-phase)')
-            axes[row, 2].set_ylabel('Q (Quadrature)')
+                ax2.set_xlabel('I (norm)', fontsize=9)
+
+            # Column 3: ViT image
+            ax3 = fig.add_subplot(gs[row, 3])
+            im = ax3.imshow(vit_image[0], aspect='auto', cmap='viridis', interpolation='nearest')
+            if row == 0:
+                ax3.set_title('ViT Image [32×64]', fontsize=10, fontweight='bold')
+            if row == len(available_mods) - 1:
+                ax3.set_xlabel('Width', fontsize=9)
+                ax3.set_ylabel('Height', fontsize=9)
 
         plt.tight_layout()
         save_path = config.OUTPUT_DIR / "modulation_overview.png"
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  ✅ Saved: {save_path}")
+        plt.savefig(save_path, dpi=config.OUTPUT_DPI, bbox_inches='tight')
+        print(f"  ✅ Saved: {save_path} (DPI={config.OUTPUT_DPI})")
         plt.close()
 
 
 def main():
     """Main visualization function"""
     parser = argparse.ArgumentParser(
-        description='Visualize Raw IQ Signals (RadioML 2018.01A uses 1 sample/symbol by default)')
+        description='Visualize preprocessing pipeline for ViT and Transformer approaches')
     parser.add_argument('--file_path', type=str, help='Path to HDF5 file')
     parser.add_argument('--json_path', type=str, help='Path to JSON file')
     parser.add_argument('--output_dir', type=str, help='Output directory')
     parser.add_argument('--modulations', type=str, nargs='+', help='Specific modulations to visualize')
     parser.add_argument('--num_samples', type=int, default=3, help='Number of samples per modulation')
     parser.add_argument('--create_overview', action='store_true', help='Create overview plot')
-    parser.add_argument('--snr_comparison', action='store_true', help='Create SNR comparison plots')
-    parser.add_argument('--sps', type=int, default=1,
-                       help='Samples per symbol (default: 1 for RadioML 2018.01A, >1 enables DSP processing)')
-    parser.add_argument('--timing_method', type=str, default='simple_energy',
-                       choices=['gardner', 'mueller_muller', 'simple_energy', 'simple_correlation'],
-                       help='Timing recovery method for SPS>1 (default: simple_energy)')
+    parser.add_argument('--dpi', type=int, default=600, help='Output DPI (default: 600 for publication)')
 
     args = parser.parse_args()
 
@@ -900,27 +575,29 @@ def main():
         config.OUTPUT_DIR = Path(args.output_dir)
     if args.num_samples:
         config.NUM_SAMPLES_PER_MOD = args.num_samples
-    if args.sps:
-        config.SAMPLES_PER_SYMBOL = args.sps
-    if args.timing_method:
-        config.TIMING_METHOD = args.timing_method
+    if args.dpi:
+        config.OUTPUT_DPI = args.dpi
 
     # Create output directory
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     print("="*70)
-    print("RAW IQ SIGNAL VISUALIZATION")
+    print("PREPROCESSING PIPELINE VISUALIZATION")
     print("="*70)
-    print(f"Processing Mode:")
-    if config.SAMPLES_PER_SYMBOL == 1:
-        print(f"  - 1 sample per symbol (NO DSP processing)")
-        print(f"  - Each sample is already a symbol decision point")
-    else:
-        print(f"  - {config.SAMPLES_PER_SYMBOL} samples per symbol (DSP processing enabled)")
-        print(f"  - Timing recovery method: {config.TIMING_METHOD}")
+    print(f"Output DPI: {config.OUTPUT_DPI} (publication quality)")
+    print(f"ViT image dimensions: {config.VIT_HEIGHT} × {config.VIT_WIDTH}")
+    print(f"Transformer sequence length: {config.SEQUENCE_LENGTH}")
 
     # Load dataset info
     dataset_info = load_dataset_info(config.FILE_PATH, config.JSON_PATH)
+
+    # Calculate normalization statistics
+    print(f"\n📊 Calculating normalization statistics...")
+    all_indices = np.arange(len(dataset_info['Y_strings']))
+    stats = calculate_normalization_stats(config.FILE_PATH, all_indices)
+    print(f"✅ Normalization stats:")
+    print(f"   I: mean={stats['i_mean']:.6f}, std={stats['i_std']:.6f}")
+    print(f"   Q: mean={stats['q_mean']:.6f}, std={stats['q_std']:.6f}")
 
     # Determine which modulations to visualize
     if args.modulations:
@@ -935,9 +612,7 @@ def main():
 
     # Create overview plot
     if args.create_overview or not args.modulations:
-        create_overview_plot(config.FILE_PATH, dataset_info, config,
-                           sps=config.SAMPLES_PER_SYMBOL,
-                           timing_method=config.TIMING_METHOD)
+        create_overview_plot(config.FILE_PATH, dataset_info, config, stats)
 
     # Visualize each modulation
     for modulation in modulations_to_viz:
@@ -947,26 +622,15 @@ def main():
                 dataset_info,
                 modulation,
                 config,
-                num_samples=config.NUM_SAMPLES_PER_MOD,
-                sps=config.SAMPLES_PER_SYMBOL,
-                timing_method=config.TIMING_METHOD
+                stats,
+                num_samples=config.NUM_SAMPLES_PER_MOD
             )
-
-            # Create SNR comparison if requested
-            if args.snr_comparison:
-                visualize_snr_comparison(
-                    config.FILE_PATH,
-                    dataset_info,
-                    modulation,
-                    config,
-                    sps=config.SAMPLES_PER_SYMBOL,
-                    timing_method=config.TIMING_METHOD
-                )
         else:
             print(f"  ⚠️  Skipping unknown modulation: {modulation}")
 
     print("\n" + "="*70)
     print(f"✅ Visualization complete! Results saved to: {config.OUTPUT_DIR}")
+    print(f"   High-resolution figures ready for publication (DPI={config.OUTPUT_DPI})")
     print("="*70)
 
 
