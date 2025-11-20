@@ -106,7 +106,7 @@ class Config:
     SAVE_FREQ = 5
     
     # Optuna settings (Academically rigorous configuration)
-    N_EPOCHS_PER_TRIAL = 20  # Enough to assess convergence
+    N_EPOCHS_PER_TRIAL = 50  # Enough to assess convergence
     N_TRIALS = 50            # Good balance for thorough search
     PRUNE_STARTUP_TRIALS = 5 # Allow initial exploration
     PRUNE_WARMUP_STEPS = 5   # Give trials time to show promise
