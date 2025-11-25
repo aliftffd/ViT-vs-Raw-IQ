@@ -1,6 +1,7 @@
 """
-Main Training Script for AMC Transformer
-OPTIMIZED FOR 16GB VRAM - Memory Efficient Tuning
+AMC Transformer Hyperparameter Tuning with Optuna
+OPTIMIZED FOR 16GB VRAM with Dynamic Memory Management
+WITH STRATIFIED SAMPLING - FIXED VERSION
 """
 
 import os
@@ -11,20 +12,23 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 import warnings
+warnings.filterwarnings("ignore", message="h5py is running against HDF5")
 import gc
+import pickle
+import psutil
+from collections import defaultdict
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 import optuna
-from optuna.storages import InMemoryStorage
+from optuna.storages import RDBStorage
+import h5py
 
-warnings.filterwarnings("ignore", message="h5py is running against HDF5")
-
-# Add parent directory to path to import custom modules
+# Add parent directory to path
 script_dir = Path(__file__).resolve().parent
 sys.path.append(str(script_dir.parent))
 
@@ -33,19 +37,280 @@ from dataloader.utils import split_data
 from models.transformer_rawIQ import AMCTransformer
 from training.utils import (
     save_checkpoint, 
-    load_checkpoint,
     plot_training_history,
     EarlyStopping,
     get_lr,
     evaluate_model_with_confusion
 )
+import torch
+torch.cuda.empty_cache()
 
 # ============================================
-# OPTIMIZED CONFIGURATION FOR 16GB VRAM
+# STRATIFIED SAMPLING FUNCTIONS - FIXED
+# ============================================
+
+def get_dataset_labels_and_snrs(file_path, json_path, target_modulations):
+    """Extract labels and SNRs from dataset for stratified sampling - FIXED VERSION"""
+    
+    # Load JSON labels - it's a list, not a dict
+    with open(json_path, 'r') as f:
+        modulation_names = json.load(f)  # This is the list of 24 modulation names
+    
+    print(f"📋 Loaded {len(modulation_names)} modulation names from JSON")
+    
+    # Load HDF5 file to get actual labels and SNR values
+    with h5py.File(file_path, 'r') as f:
+        Y_one_hot = f['Y'][:]  # One-hot encoded labels (2555904, 24)
+        Z = f['Z'][:]  # SNR values (2555904, 1)
+    
+    print(f"📊 HDF5 shapes - Y: {Y_one_hot.shape}, Z: {Z.shape}")
+    
+    # Convert one-hot to class indices and then to modulation names
+    Y_indices = np.argmax(Y_one_hot, axis=1)
+    Y_strings = [modulation_names[idx] for idx in Y_indices]
+    Y_strings = np.array(Y_strings)
+    Z_values = Z.flatten()  # Convert (N,1) to (N,)
+    
+    # Filter for target modulations only
+    target_mask = np.isin(Y_strings, target_modulations)
+    all_indices = np.where(target_mask)[0]
+    filtered_Y = Y_strings[target_mask]
+    filtered_Z = Z_values[target_mask]
+    
+    print(f"✅ Filtered for target modulations: {len(all_indices):,} samples")
+    print(f"   Target modulations: {target_modulations}")
+    
+    return all_indices, filtered_Y, filtered_Z
+
+def stratified_split_data(file_path, json_path, target_modulations, train_size=0.7, val_size=0.15, test_size=0.15, seed=42):
+    """
+    Perform stratified sampling by modulation and SNR - FIXED VERSION
+    """
+    np.random.seed(seed)
+    
+    # Get all indices with their labels and SNRs
+    all_indices, Y_strings, Z_values = get_dataset_labels_and_snrs(file_path, json_path, target_modulations)
+    
+    print(f"🎯 Starting stratified split with {len(all_indices):,} samples")
+    
+    # Create strata: group by modulation and binned SNR (2dB bins for better grouping)
+    strata = defaultdict(list)
+    
+    # FIX: Create a lookup map for the print function later
+    # Maps Absolute HDF5 Index -> (Modulation, SNR)
+    metadata_lookup = {}
+    
+    for idx, mod, snr in zip(all_indices, Y_strings, Z_values):
+        # Store metadata for lookup
+        metadata_lookup[idx] = (mod, snr)
+        
+        # Bin SNR in 2dB steps
+        snr_bin = int(np.round(snr / 2) * 2)
+        key = f"{mod}_SNR{snr_bin:+d}"
+        strata[key].append(idx)
+    
+    print(f"📈 Created {len(strata)} strata (modulation × SNR bins)")
+    
+    # Split each stratum proportionally
+    train_indices = []
+    val_indices = []
+    test_indices = []
+    
+    strata_used = 0
+    for stratum_key, stratum_indices in strata.items():
+        n_stratum = len(stratum_indices)
+        
+        # Skip strata with too few samples
+        if n_stratum < 3:
+            continue
+            
+        strata_used += 1
+        
+        # Shuffle stratum
+        np.random.shuffle(stratum_indices)
+        
+        # Calculate split sizes for this stratum
+        n_train = int(n_stratum * train_size)
+        n_val = int(n_stratum * val_size)
+        n_test = n_stratum - n_train - n_val
+        
+        # Ensure we have at least 1 sample in each split
+        if n_train > 0 and n_val > 0 and n_test > 0:
+            train_indices.extend(stratum_indices[:n_train])
+            val_indices.extend(stratum_indices[n_train:n_train + n_val])
+            test_indices.extend(stratum_indices[n_train + n_val:])
+    
+    # Convert to numpy arrays
+    train_indices = np.array(train_indices)
+    val_indices = np.array(val_indices)
+    test_indices = np.array(test_indices)
+    
+    # Create label map
+    label_map = {mod: idx for idx, mod in enumerate(target_modulations)}
+    
+    print(f"✅ Stratified split completed:")
+    print(f"   Used {strata_used}/{len(strata)} strata")
+    print(f"   Train: {len(train_indices):,} samples")
+    print(f"   Validation: {len(val_indices):,} samples")
+    print(f"   Test: {len(test_indices):,} samples")
+    
+    # FIX: Pass the lookup dictionary instead of the raw arrays
+    print_distribution_stats(train_indices, val_indices, test_indices, metadata_lookup, "Stratified Split")
+    
+    return train_indices, val_indices, test_indices, label_map
+
+def stratified_sampling(indices, Y_strings, Z_values, target_modulations, ratio=0.1, seed=42):
+    """Create stratified subset for fast tuning - FIXED VERSION"""
+    np.random.seed(seed)
+    
+    print(f"🎯 Creating stratified subset with {ratio*100:.1f}% ratio")
+    
+    # Create strata
+    strata = defaultdict(list)
+    for idx, mod, snr in zip(indices, Y_strings, Z_values):
+        snr_bin = int(np.round(snr / 2) * 2)  # 2dB bins
+        key = f"{mod}_SNR{snr_bin:+d}"
+        strata[key].append(idx)
+    
+    print(f"📈 Sampling from {len(strata)} strata")
+    
+    # Sample from each stratum
+    subset = []
+    strata_used = 0
+    for key, stratum_indices in strata.items():
+        n_samples = max(1, int(len(stratum_indices) * ratio))
+        if n_samples <= len(stratum_indices):
+            sampled = np.random.choice(stratum_indices, n_samples, replace=False)
+            subset.extend(sampled)
+            strata_used += 1
+    
+    subset = np.array(subset)
+    
+    print(f"✅ Stratified subset created: {len(subset):,} samples from {strata_used} strata (was {len(indices):,})")
+    
+    return subset
+
+def print_distribution_stats(train_indices, val_indices, test_indices, metadata_lookup, split_name):
+    """Print distribution statistics for splits - FIXED VERSION"""
+    
+    def get_split_stats(indices, lookup_dict, split_name):
+        if len(indices) == 0:
+            return {'total': 0, 'mod_counts': {}, 'snr_range': "N/A"}
+            
+        mod_counts = defaultdict(int)
+        snr_values = []
+        
+        for idx in indices:
+            # FIX: Use dictionary lookup instead of array indexing
+            # idx is the HDF5 absolute index
+            if idx in lookup_dict:
+                mod, snr = lookup_dict[idx]
+                mod_counts[mod] += 1
+                snr_values.append(snr)
+        
+        return {
+            'total': len(indices),
+            'mod_counts': mod_counts,
+            'snr_range': f"{min(snr_values):.0f} to {max(snr_values):.0f} dB" if snr_values else "N/A"
+        }
+    
+    train_stats = get_split_stats(train_indices, metadata_lookup, "Train")
+    val_stats = get_split_stats(val_indices, metadata_lookup, "Validation")
+    test_stats = get_split_stats(test_indices, metadata_lookup, "Test")
+    
+    print(f"\n📊 {split_name} Distribution:")
+    print(f"   Train: {train_stats['total']:,} samples, SNR: {train_stats['snr_range']}")
+    print(f"   Validation: {val_stats['total']:,} samples, SNR: {val_stats['snr_range']}") 
+    print(f"   Test: {test_stats['total']:,} samples, SNR: {test_stats['snr_range']}")
+    
+    # Show modulation distribution
+    print(f"\n   Modulation Distribution:")
+    all_mods = sorted(set(train_stats['mod_counts'].keys()) | set(val_stats['mod_counts'].keys()) | set(test_stats['mod_counts'].keys()))
+    
+    print(f"     {'Modulation':<12} {'Train':>8} {'Val':>8} {'Test':>8}")
+    print(f"     {'-'*12} {'-'*8} {'-'*8} {'-'*8}")
+    
+    for mod in all_mods:
+        train_count = train_stats['mod_counts'].get(mod, 0)
+        val_count = val_stats['mod_counts'].get(mod, 0)
+        test_count = test_stats['mod_counts'].get(mod, 0)
+        total = train_count + val_count + test_count
+        if total > 0:
+            print(f"     {mod:<12} {train_count:>8} {val_count:>8} {test_count:>8}")
+
+# ============================================
+# MEMORY MONITORING (unchanged)
+# ============================================
+
+class MemoryMonitor:
+    """Monitor GPU and system memory"""
+    
+    def __init__(self, vram_threshold=0.90, ram_threshold=0.85):
+        self.vram_threshold = vram_threshold
+        self.ram_threshold = ram_threshold
+        self.has_cuda = torch.cuda.is_available()
+        
+    def get_memory_status(self):
+        """Get current memory usage"""
+        status = {
+            'ram_used_gb': 0,
+            'ram_total_gb': 0,
+            'ram_percent': 0,
+            'vram_used_gb': 0,
+            'vram_total_gb': 0,
+            'vram_percent': 0,
+            'vram_available_gb': 0
+        }
+        
+        # System RAM
+        ram = psutil.virtual_memory()
+        status['ram_used_gb'] = ram.used / (1024**3)
+        status['ram_total_gb'] = ram.total / (1024**3)
+        status['ram_percent'] = ram.percent / 100
+        
+        # GPU VRAM
+        if self.has_cuda:
+            vram_used = torch.cuda.memory_allocated() / (1024**3)
+            vram_reserved = torch.cuda.memory_reserved() / (1024**3)
+            vram_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            
+            status['vram_used_gb'] = vram_reserved
+            status['vram_total_gb'] = vram_total
+            status['vram_percent'] = vram_reserved / vram_total
+            status['vram_available_gb'] = vram_total - vram_reserved
+        
+        return status
+    
+    def is_memory_critical(self):
+        """Check if memory usage is critical"""
+        status = self.get_memory_status()
+        
+        ram_critical = status['ram_percent'] > self.ram_threshold
+        vram_critical = status['vram_percent'] > self.vram_threshold if self.has_cuda else False
+        
+        return ram_critical or vram_critical, status
+    
+    def clear_memory(self):
+        """Aggressive memory clearing"""
+        gc.collect()
+        if self.has_cuda:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+    
+    def print_status(self, prefix=""):
+        """Print current memory status"""
+        status = self.get_memory_status()
+        print(f"{prefix}RAM: {status['ram_used_gb']:.1f}/{status['ram_total_gb']:.1f}GB "
+              f"({status['ram_percent']*100:.1f}%) | "
+              f"VRAM: {status['vram_used_gb']:.1f}/{status['vram_total_gb']:.1f}GB "
+              f"({status['vram_percent']*100:.1f}%)")
+
+# ============================================
+# CONFIGURATION (unchanged)
 # ============================================
 
 class Config:
-    """Training configuration optimized for 16GB VRAM with 80-85% target utilization"""
+    """Tuning configuration with memory management"""
     
     # Paths
     DATA_DIR = Path("data")
@@ -53,7 +318,7 @@ class Config:
     JSON_PATH = 'C:\\workarea\\Research and Thesis\\dataset\\radioml2018\\versions\\2\\classes-fixed.json' 
     CHECKPOINT_DIR = Path("result/checkpoints")
     LOG_DIR = Path("result/logs")
-    DB_DIR = Path("result/optuna_db")
+    STUDY_DIR = Path("result/optuna_studies")
     
     # Data split
     TRAIN_SIZE = 0.7
@@ -69,216 +334,269 @@ class Config:
         '128QAM', '256QAM', 'GMSK', 'OQPSK'
     ]
     
-    # --- Model architecture (Based on proven working configuration) ---
+    # Fixed model parameters
     SEQ_LENGTH = 1024
-    EMBEDDING_TYPE = 'segment'
-    SEGMENT_SIZE = 16
-    USE_CLS_TOKEN = True
-    D_MODEL = 256        # Proven working configuration
-    N_HEAD = 16          # Proven working configuration
-    N_LAYERS = 9         # Proven working configuration
-    FFN_HIDDEN = 512     # From proven config
-    DROP_PROB = 0.1      # From proven config
     
-    # Training hyperparameters (Based on proven configuration)
-    BATCH_SIZE = 128     # Proven working batch size
-    NUM_EPOCHS = 100
-    LEARNING_RATE = 1e-4
-    WEIGHT_DECAY = 1e-3  # From proven config
-    LABEL_SMOOTHING = 0.1
-    GRAD_CLIP_MAX_NORM = 1.0
-    
-    # DataLoader settings (Optimized for 32GB RAM)
-    NUM_WORKERS = 8      # Proven to work well
-    PREFETCH_FACTOR = 3  # Balanced prefetching
+    # DataLoader settings
+    NUM_WORKERS = 4
+    PREFETCH_FACTOR = 2
     PIN_MEMORY = True
-    PERSISTENT_WORKERS = True  # Keep workers alive between epochs
+    PERSISTENT_WORKERS = True
     
-    # Mixed precision training (NEW - saves VRAM and speeds up)
-    USE_AMP = True  # Automatic Mixed Precision
+    # Mixed precision
+    USE_AMP = True
     
-    # Memory management (OPTIMIZED)
-    CACHE_CLEAR_FREQUENCY = 50  # Clear cache less frequently (was every 100)
-    EMPTY_CACHE_BETWEEN_TRIALS = True  # Aggressive cleanup between trials
+    # Memory management
+    CACHE_CLEAR_FREQUENCY = 30
+    EMPTY_CACHE_BETWEEN_TRIALS = True
+    VRAM_SAFETY_MARGIN = 2.0
+    ENABLE_MEMORY_FALLBACK = True
     
-    # Early stopping & checkpointing
-    PATIENCE = 10
-    SAVE_FREQ = 5
-    
-    # Optuna settings (Academically rigorous configuration)
-    N_EPOCHS_PER_TRIAL = 50  # Enough to assess convergence
-    N_TRIALS = 50            # Good balance for thorough search
-    PRUNE_STARTUP_TRIALS = 5 # Allow initial exploration
-    PRUNE_WARMUP_STEPS = 5   # Give trials time to show promise
+    # Optuna settings
+    N_EPOCHS_PER_TRIAL = 50
+    N_TRIALS = 50
+    PATIENCE_PER_TRIAL = 7
+    PRUNE_STARTUP_TRIALS = 5
+    PRUNE_WARMUP_STEPS = 5
+    SAVE_BEST_MODELS = True
     
     # Device
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    @classmethod
-    def validate(cls):
-        """Validate configuration parameters"""
-        errors = []
-        
-        if not Path(cls.FILE_PATH).exists():
-            errors.append(f"HDF5 file not found: {cls.FILE_PATH}")
-        if not Path(cls.JSON_PATH).exists():
-            errors.append(f"JSON file not found: {cls.JSON_PATH}")
-        
-        split_sum = cls.TRAIN_SIZE + cls.VALID_SIZE + cls.TEST_SIZE
-        if not np.isclose(split_sum, 1.0):
-            errors.append(f"Data splits must sum to 1.0, got {split_sum}")
-        
-        if cls.D_MODEL % cls.N_HEAD != 0:
-            errors.append(f"D_MODEL ({cls.D_MODEL}) must be divisible by N_HEAD ({cls.N_HEAD})")
-        
-        if cls.BATCH_SIZE <= 0: errors.append("BATCH_SIZE must be positive")
-        if cls.NUM_EPOCHS <= 0: errors.append("NUM_EPOCHS must be positive")
-        if cls.LEARNING_RATE <= 0: errors.append("LEARNING_RATE must be positive")
-        
-        if cls.NUM_WORKERS < 0:
-            errors.append(f"NUM_WORKERS cannot be negative, got {cls.NUM_WORKERS}")
-        
-        # Warnings for memory constraints
-        if cls.NUM_WORKERS > 8:
-            warnings.warn(f"NUM_WORKERS={cls.NUM_WORKERS} might cause RAM pressure. Consider 2-4 for 32GB RAM")
-        if cls.PREFETCH_FACTOR > 2 and cls.NUM_WORKERS > 4:
-            warnings.warn(f"PREFETCH_FACTOR={cls.PREFETCH_FACTOR} with {cls.NUM_WORKERS} workers = high RAM usage")
-            
-        if errors:
-            raise ValueError("Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors))
-        
-        return True
-    
-    @classmethod
-    def from_args(cls, args):
-        """Update config from command line arguments with validation"""
-        for key, value in vars(args).items():
-            if value is not None and hasattr(cls, key.upper()):
-                setattr(cls, key.upper(), value)
-        
-        if not args.tune:
-            cls.validate()
-        return cls
 
+# [Rest of the code remains the same - Memory tiers, AdaptiveHyperparameters, StudyState, training functions, etc.]
+# ============================================
+# MEMORY-AWARE HYPERPARAMETER SPACE
+# ============================================
 
-def parse_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(
-        description='Train or Tune AMC Transformer (16GB VRAM optimized)',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    
-    # Data arguments
-    parser.add_argument('--file_path', type=str, help='Path to HDF5 data file')
-    parser.add_argument('--json_path', type=str, help='Path to classes JSON file')
-    
-    # Training arguments
-    parser.add_argument('--batch_size', type=int, help='Batch size (recommended: 32-64 for 16GB VRAM)')
-    parser.add_argument('--num_epochs', type=int, help='Number of epochs')
-    parser.add_argument('--learning_rate', type=float, help='Learning rate')
-    parser.add_argument('--num_workers', type=int, help='Number of data loading workers (recommended: 2-4 for 32GB RAM)')
-    
-    # Model arguments
-    parser.add_argument('--d_model', type=int, help='Model dimension (recommended: 64-128 for 16GB VRAM)')
-    parser.add_argument('--n_head', type=int, help='Number of attention heads')
-    parser.add_argument('--n_layers', type=int, help='Number of transformer layers (recommended: 3-4 for 16GB VRAM)')
-    
-    # Memory optimization
-    parser.add_argument('--use_amp', action='store_true', default=True, help='Use automatic mixed precision (default: True)')
-    parser.add_argument('--no_amp', dest='use_amp', action='store_false', help='Disable automatic mixed precision')
-    
-    # Other
-    parser.add_argument('--resume', type=str, help='Path to checkpoint to resume from (single run only)')
-    parser.add_argument('--experiment_name', type=str, help='Experiment name for logging')
-    
-    # Optuna arguments
-    parser.add_argument('--tune', action='store_true', help='Run Optuna hyperparameter tuning')
-    parser.add_argument('--n_trials', type=int, help='Number of Optuna trials to run')
-    parser.add_argument('--study_name', type=str, default=f"amc_study_{datetime.now().strftime('%Y%m%d')}")
-    
-    return parser.parse_args()
-
-
-def get_config_dict(config):
-    """Convert Config class to serializable dictionary"""
-    return {
-        'BATCH_SIZE': config.BATCH_SIZE,
-        'NUM_EPOCHS': config.NUM_EPOCHS,
-        'LEARNING_RATE': config.LEARNING_RATE,
-        'WEIGHT_DECAY': config.WEIGHT_DECAY,
-        'LABEL_SMOOTHING': config.LABEL_SMOOTHING,
-        'GRAD_CLIP_MAX_NORM': config.GRAD_CLIP_MAX_NORM,
-        'NUM_WORKERS': config.NUM_WORKERS,
-        'PREFETCH_FACTOR': config.PREFETCH_FACTOR,
-        'USE_AMP': config.USE_AMP,
-        'SEQ_LENGTH': config.SEQ_LENGTH,
-        'EMBEDDING_TYPE': config.EMBEDDING_TYPE,
-        'SEGMENT_SIZE': config.SEGMENT_SIZE,
-        'USE_CLS_TOKEN': config.USE_CLS_TOKEN,
-        'D_MODEL': config.D_MODEL,
-        'N_HEAD': config.N_HEAD,
-        'N_LAYERS': config.N_LAYERS,
-        'FFN_HIDDEN': config.FFN_HIDDEN,
-        'DROP_PROB': config.DROP_PROB,
-        'TARGET_MODULATIONS': config.TARGET_MODULATIONS,
-        'TRAIN_SIZE': config.TRAIN_SIZE,
-        'VALID_SIZE': config.VALID_SIZE,
-        'TEST_SIZE': config.TEST_SIZE,
-        'FILE_PATH': str(config.FILE_PATH),
-        'JSON_PATH': str(config.JSON_PATH),
-        'SPLIT_SEED': config.SPLIT_SEED,
-        'NORM_SEED': config.NORM_SEED,
-        'PATIENCE': config.PATIENCE,
-        'SAVE_FREQ': config.SAVE_FREQ
+CONFIGURATION_TIERS = [
+    # Tier 0: Minimal
+    {
+        'd_model': [32, 48],
+        'n_layers': [2, 3],
+        'batch_size': [8, 16],
+        'tier_name': 'ultra_minimal',
+        'max_vram': 2.0
+    },
+    # Tier 1: Very Small
+    {
+        'd_model': [64],
+        'n_layers': [3, 4],
+        'batch_size': [16, 24],
+        'tier_name': 'very_small',
+        'max_vram': 3.0
+    },
+    # Tier 2: Small
+    {
+        'd_model': [96, 128],
+        'n_layers': [4, 5],
+        'batch_size': [32, 48],
+        'tier_name': 'small',
+        'max_vram': 5.0
+    },
+    # Tier 3: Medium
+    {
+        'd_model': [128, 160],
+        'n_layers': [6, 7],
+        'batch_size': [48, 64],
+        'tier_name': 'medium',
+        'max_vram': 7.0
+    },
+    # Tier 4: Large
+    {
+        'd_model': [192, 224, 256],
+        'n_layers': [8, 9],
+        'batch_size': [64, 96],
+        'tier_name': 'large',
+        'max_vram': 10.0
     }
+]
 
+def get_memory_constraints(d_model, n_layers, batch_size, use_amp=True):
+    """Estimate VRAM usage"""
+    seq_length = 1024
+    num_classes = 19
+    
+    # Parameter estimation
+    params_per_layer = 4 * d_model * d_model + 8 * d_model * d_model + 4 * d_model
+    total_params = params_per_layer * n_layers + 2 * seq_length * d_model + d_model * num_classes
+    
+    # Memory in GB
+    param_memory = (total_params * 4) / (1024**3)
+    optimizer_memory = param_memory * 2
+    
+    # Activation memory (reduced with AMP)
+    activation_memory = (batch_size * seq_length * d_model * n_layers * 12 * 4) / (1024**3)
+    if use_amp:
+        activation_memory *= 0.6
+    
+    # Total with overhead
+    estimated_vram = (param_memory + optimizer_memory + activation_memory) * 1.3
+    
+    return estimated_vram
+
+class AdaptiveHyperparameters:
+    """Manages hyperparameter selection with memory fallback"""
+    
+    def __init__(self, memory_monitor, config):
+        self.memory_monitor = memory_monitor
+        self.config = config
+        self.current_tier = len(CONFIGURATION_TIERS) - 1
+        self.tier_history = {}
+        
+    def get_available_tier(self):
+        """Get the highest tier that fits in available memory"""
+        status = self.memory_monitor.get_memory_status()
+        available_vram = status['vram_available_gb']
+        
+        # Account for safety margin
+        safe_vram = available_vram - self.config.VRAM_SAFETY_MARGIN
+        
+        # Find appropriate tier
+        for i in range(self.current_tier, -1, -1):
+            tier = CONFIGURATION_TIERS[i]
+            if tier['max_vram'] <= safe_vram:
+                return i
+        
+        return 0  # Fallback to minimal
+    
+    def suggest_with_fallback(self, trial, forced_tier=None):
+        """Suggest hyperparameters with automatic tier fallback"""
+        
+        # Determine tier to use
+        if forced_tier is not None:
+            tier_idx = forced_tier
+        else:
+            tier_idx = self.get_available_tier()
+        
+        tier = CONFIGURATION_TIERS[tier_idx]
+        
+        # Record tier usage
+        self.tier_history[trial.number] = tier_idx
+        
+        # Architecture parameters from tier
+        d_model = trial.suggest_categorical(f"d_model", tier['d_model'])
+        n_layers = trial.suggest_int(f"n_layers", min(tier['n_layers']), max(tier['n_layers']))
+        batch_size = trial.suggest_categorical(f"batch_size", tier['batch_size'])
+        
+        # Fixed or universal parameters
+        embedding_type = trial.suggest_categorical('embedding_type', ['segment', 'conv1d'])
+        segment_size = trial.suggest_categorical('segment_size', [16, 32]) if embedding_type == 'segment' else 16
+        n_head = trial.suggest_categorical("n_head", [8, 16])
+        
+        # Ensure n_head divides d_model
+        if d_model % n_head != 0:
+            n_head = 8 if d_model % 8 == 0 else 4
+        
+        ffn_multiplier = trial.suggest_categorical("ffn_multiplier", [2, 3, 4])
+        
+        # Regularization
+        drop_prob = trial.suggest_float("drop_prob", 0.05, 0.25)
+        use_cls_token = trial.suggest_categorical("use_cls_token", [True, False])
+        label_smoothing = trial.suggest_float("label_smoothing", 0.0, 0.2)
+        
+        # Optimization
+        learning_rate = trial.suggest_float("learning_rate", 5e-5, 3e-4, log=True)
+        weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
+        optimizer_name = trial.suggest_categorical("optimizer", ['AdamW', 'Adam'])
+        
+        # Calculate estimated VRAM
+        estimated_vram = get_memory_constraints(d_model, n_layers, batch_size, self.config.USE_AMP)
+        
+        return {
+            'embedding_type': embedding_type,
+            'segment_size': segment_size,
+            'd_model': d_model,
+            'n_head': n_head,
+            'n_layers': n_layers,
+            'ffn_multiplier': ffn_multiplier,
+            'drop_prob': drop_prob,
+            'use_cls_token': use_cls_token,
+            'batch_size': batch_size,
+            'learning_rate': learning_rate,
+            'weight_decay': weight_decay,
+            'optimizer_name': optimizer_name,
+            'label_smoothing': label_smoothing,
+            'estimated_vram': estimated_vram,
+            'tier': tier_idx,
+            'tier_name': tier['tier_name']
+        }
 
 # ============================================
-# MEMORY-EFFICIENT TRAINING FUNCTIONS WITH AMP
+# STUDY STATE MANAGEMENT
 # ============================================
 
-def train_epoch(model, train_loader, criterion, optimizer, device, epoch, config, scaler=None, trial=None):
-    """Train for one epoch with mixed precision support"""
+class StudyState:
+    """Manages persistent state across study interruptions"""
+    
+    def __init__(self, study_dir: Path):
+        self.study_dir = study_dir
+        self.state_file = study_dir / "study_state.pkl"
+        self.best_models_dir = study_dir / "best_models"
+        self.best_models_dir.mkdir(parents=True, exist_ok=True)
+        
+    def save(self, state_dict):
+        """Save study state"""
+        with open(self.state_file, 'wb') as f:
+            pickle.dump(state_dict, f)
+    
+    def load(self):
+        """Load study state if exists"""
+        if self.state_file.exists():
+            with open(self.state_file, 'rb') as f:
+                return pickle.load(f)
+        return None
+    
+    def save_trial_checkpoint(self, trial_number, model_state, params, metrics):
+        """Save best model from a trial"""
+        checkpoint_path = self.best_models_dir / f"trial_{trial_number}_best.pth"
+        torch.save({
+            'trial_number': trial_number,
+            'model_state_dict': model_state,
+            'params': params,
+            'metrics': metrics,
+            'timestamp': datetime.now().isoformat()
+        }, checkpoint_path)
+        return checkpoint_path
+
+# ============================================
+# TRAINING WITH MEMORY RECOVERY
+# ============================================
+
+def train_one_epoch(model, train_loader, criterion, optimizer, device, 
+                    epoch, config, scaler=None, trial=None):
+    """Train for one epoch - fail fast on OOM"""
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
     
-    desc = f'Epoch {epoch+1} [Train]'
-    if trial:
-        desc = f'Trial {trial.number} Epoch {epoch+1} [Train]'
-        
-    pbar = tqdm(train_loader, desc=desc, leave=False)
+    desc = f'Trial {trial.number} Epoch {epoch+1}' if trial else f'Epoch {epoch+1}'
+    pbar = tqdm(train_loader, desc=f'{desc} [Train]', leave=False)
     
     use_amp = config.USE_AMP and scaler is not None
     
     for batch_idx, (images, labels, snrs) in enumerate(pbar):
-        # Less frequent cache clearing
-        if batch_idx % config.CACHE_CLEAR_FREQUENCY == 0 and batch_idx > 0 and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        # Don't skip batches - fail fast on OOM
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         
-        optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         
         if use_amp:
-            # Mixed precision forward pass
             with torch.amp.autocast(device_type='cuda'):
                 outputs = model(images)
                 loss = criterion(outputs, labels)
             
-            # Mixed precision backward pass
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.GRAD_CLIP_MAX_NORM)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
-            # Standard precision
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.GRAD_CLIP_MAX_NORM)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
         
         running_loss += loss.item()
@@ -286,34 +604,29 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch, config
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
         
-        avg_loss = running_loss / (batch_idx + 1)
-        acc = 100. * correct / total
-        pbar.set_postfix({'loss': f'{avg_loss:.4f}', 'acc': f'{acc:.2f}%'})
+        pbar.set_postfix({
+            'loss': f'{running_loss/(batch_idx+1):.4f}',
+            'acc': f'{100.*correct/total:.2f}%'
+        })
     
-    epoch_loss = running_loss / len(train_loader)
-    epoch_acc = 100. * correct / total
-    
-    return epoch_loss, epoch_acc
-
+    return running_loss / len(train_loader), 100. * correct / total
 
 def validate_epoch(model, val_loader, criterion, device, epoch, config, trial=None):
-    """Validate for one epoch with mixed precision support"""
+    """Validate epoch"""
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
     
-    desc = f'Epoch {epoch+1} [Valid]'
-    if trial:
-        desc = f'Trial {trial.number} Epoch {epoch+1} [Valid]'
-
-    pbar = tqdm(val_loader, desc=desc, leave=False)
+    desc = f'Trial {trial.number} Epoch {epoch+1}' if trial else f'Epoch {epoch+1}'
+    pbar = tqdm(val_loader, desc=f'{desc} [Valid]', leave=False)
     
     use_amp = config.USE_AMP and torch.cuda.is_available()
     
     with torch.no_grad():
-        for batch_idx, (images, labels, snrs) in enumerate(pbar):
-            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        for images, labels, snrs in pbar:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             
             if use_amp:
                 with torch.amp.autocast(device_type='cuda'):
@@ -328,791 +641,322 @@ def validate_epoch(model, val_loader, criterion, device, epoch, config, trial=No
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
             
-            avg_loss = running_loss / (batch_idx + 1)
-            acc = 100. * correct / total
-            pbar.set_postfix({'loss': f'{avg_loss:.4f}', 'acc': f'{acc:.2f}%'})
+            pbar.set_postfix({
+                'loss': f'{running_loss/(len(pbar)):.4f}',
+                'acc': f'{100.*correct/total:.2f}%'
+            })
     
-    epoch_loss = running_loss / len(val_loader)
-    epoch_acc = 100. * correct / total
-    
-    return epoch_loss, epoch_acc
-
+    return running_loss / len(val_loader), 100. * correct / total
 
 # ============================================
-# MEMORY-AWARE OPTUNA SEARCH SPACE
+# OBJECTIVE WITH MEMORY FALLBACK
 # ============================================
 
-def get_memory_safe_constraints(d_model, n_layers, batch_size):
-    """
-    Estimate VRAM usage for a given configuration.
-    
-    Based on empirical testing:
-    - d_model=256, n_layers=9, batch=128 uses ~10-12GB VRAM ✓
-    - This function provides estimates to avoid extreme configurations
-    
-    Returns (is_safe, estimated_vram_gb)
-    """
-    
-    seq_length = 1024
-    num_classes = 19
-    
-    # Model parameter count estimation
-    # Each transformer layer has:
-    # - Multi-head attention: 4 * d_model^2 (Q, K, V, O projections)
-    # - FFN: 2 * d_model * ffn_hidden (typically ffn_hidden = 2-4 × d_model)
-    # - Layer norms: 4 * d_model
-    
-    # Use average FFN multiplier of 3
-    avg_ffn_multiplier = 3
-    params_per_layer = (
-        4 * d_model * d_model +  # Attention
-        2 * d_model * (d_model * avg_ffn_multiplier) +  # FFN
-        4 * d_model  # Layer norms
-    )
-    
-    total_params = (
-        params_per_layer * n_layers +
-        2 * seq_length * d_model +  # Embeddings (segment + positional)
-        d_model * num_classes  # Classifier head
-    )
-    
-    # Memory estimation (in GB)
-    param_memory = (total_params * 4) / (1024**3)  # 4 bytes per float32
-    optimizer_memory = param_memory * 2  # AdamW stores 2 states (momentum + variance)
-    
-    # Activation memory estimation (forward + backward)
-    # Key tensors per layer: Q, K, V, attention scores, attention output, FFN intermediate
-    # Rough estimate: batch_size × seq_length × d_model × n_layers × 12 tensors
-    activation_memory = (
-        batch_size * seq_length * d_model * n_layers * 12 * 4  # 12 key tensors, 4 bytes each
-    ) / (1024**3)
-    
-    # Total with overhead (framework overhead, gradients, etc.)
-    base_estimate = param_memory + optimizer_memory + activation_memory
-    estimated_vram = base_estimate * 1.3  # 30% overhead for safety
-    
-    # With AMP (Automatic Mixed Precision), activations use less memory
-    if hasattr(Config, 'USE_AMP') and Config.USE_AMP:
-        estimated_vram_amp = param_memory + optimizer_memory + (activation_memory * 0.6) * 1.3
-    else:
-        estimated_vram_amp = estimated_vram
-    
-    # Safety threshold: 14GB out of 16GB
-    # We know d_model=256, n_layers=9, batch=128 works fine (~10-12GB actual)
-    # So we allow up to 14GB estimated (which tends to overestimate)
-    is_safe = estimated_vram_amp < 14.0
-    
-    return is_safe, estimated_vram_amp
-
-
-# ACADEMICALLY RIGOROUS search space based on proven working configuration
-def suggest_safe_hyperparameters(trial):
-    """
-    Suggest hyperparameters with realistic search space.
-    
-    Search space is informed by:
-    1. Proven working configuration (d_model=256, n_layers=9, batch=128)
-    2. Hardware constraints (16GB VRAM, 32GB RAM)
-    3. Transformer architecture best practices
-    """
-    
-    # Start with embedding parameters
-    embedding_type = trial.suggest_categorical('embedding_type', ['segment', 'conv1d'])
-    segment_size = trial.suggest_categorical('segment_size', [16, 32])
-    
-    # === CORE ARCHITECTURE PARAMETERS ===
-    # Based on proven configuration: d_model=256, n_layers=9
-    # Exploring around this known-good configuration
-    
-    d_model = trial.suggest_categorical("d_model", [128, 192, 256, 320])
-    
-    # Number of heads must divide d_model
-    # For d_model in [128, 192, 256, 320], valid heads are:
-    # 128: 4, 8, 16
-    # 192: 4, 8, 12, 16
-    # 256: 4, 8, 16
-    # 320: 4, 8, 10, 16
-    # We'll use common values that work for all: 8, 16
-    n_head = trial.suggest_categorical("n_head", [8, 16])
-    
-    # Constraint: n_head must divide d_model
-    if d_model % n_head != 0:
-        raise optuna.exceptions.TrialPruned()
-    
-    # Layer count - exploring around proven n_layers=9
-    n_layers = trial.suggest_int("n_layers", 6, 12)
-    
-    # FFN hidden dimension as multiplier of d_model
-    # Standard practice: 2-4× d_model
-    ffn_multiplier = trial.suggest_categorical("ffn_multiplier", [2, 3, 4])
-    ffn_hidden = d_model * ffn_multiplier
-    
-    # === BATCH SIZE ===
-    # FIX: Optuna requires fixed categorical choices across all trials
-    # We use a unified range and prune unsafe combinations
-    batch_size = trial.suggest_categorical("batch_size", [64, 96, 128, 160])
-
-    # Memory safety check with model-size-aware pruning
-    is_safe, estimated_vram = get_memory_safe_constraints(d_model, n_layers, batch_size)
-
-    # Prune unsafe configurations
-    # Strategy: Larger models need smaller batches
-    if d_model <= 192:
-        # Smaller models: all batch sizes OK if under 14GB
-        if estimated_vram > 14.0:
-            print(f"Trial {trial.number}: High VRAM ({estimated_vram:.1f}GB) - pruning")
-            raise optuna.exceptions.TrialPruned()
-    elif d_model <= 256:
-        # Medium models: avoid very large batches
-        if batch_size > 144 or estimated_vram > 14.0:
-            print(f"Trial {trial.number}: d_model={d_model}, batch={batch_size} - pruning (VRAM: {estimated_vram:.1f}GB)")
-            raise optuna.exceptions.TrialPruned()
-    else:  # d_model >= 320
-        # Larger models: only smaller batches
-        if batch_size > 128 or estimated_vram > 14.0:
-            print(f"Trial {trial.number}: d_model={d_model}, batch={batch_size} - pruning (VRAM: {estimated_vram:.1f}GB)")
-            raise optuna.exceptions.TrialPruned()
-    
-    # Log the estimate for monitoring
-    print(f"Trial {trial.number}: d={d_model}, L={n_layers}, B={batch_size} | Est. VRAM: {estimated_vram:.1f}GB")
-    
-    # === REGULARIZATION ===
-    drop_prob = trial.suggest_float("drop_prob", 0.05, 0.25)
-    use_cls_token = trial.suggest_categorical("use_cls_token", [True, False])
-    label_smoothing = trial.suggest_float("label_smoothing", 0.0, 0.2)
-    
-    # === OPTIMIZATION ===
-    learning_rate = trial.suggest_float("learning_rate", 5e-5, 3e-4, log=True)
-    weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
-    
-    # AdamW is generally preferred for transformers
-    optimizer_name = trial.suggest_categorical("optimizer", ['AdamW', 'Adam'])
-    
-    return {
-        'embedding_type': embedding_type,
-        'segment_size': segment_size,
-        'd_model': d_model,
-        'n_head': n_head,
-        'n_layers': n_layers,
-        'ffn_multiplier': ffn_multiplier,
-        'ffn_hidden': ffn_hidden,
-        'drop_prob': drop_prob,
-        'use_cls_token': use_cls_token,
-        'batch_size': batch_size,
-        'learning_rate': learning_rate,
-        'weight_decay': weight_decay,
-        'optimizer_name': optimizer_name,
-        'label_smoothing': label_smoothing
-    }
-
-
-# Global variables for datasets (reused across trials)
-g_train_dataset = None
-g_valid_dataset = None
+g_datasets = None
 g_config = None
-g_device = None
-g_train_loader = None  # NEW: Reuse dataloaders
-g_valid_loader = None
+g_study_state = None
+g_memory_monitor = None
+g_adaptive_hp = None
 
-def objective(trial: optuna.trial.Trial) -> float:
-    """Optimized Optuna objective function for 16GB VRAM"""
+def objective_with_fallback(trial: optuna.trial.Trial) -> float:
+    """Objective function with automatic memory fallback"""
     
-    global g_train_dataset, g_valid_dataset, g_config, g_device, g_train_loader, g_valid_loader
-    if g_train_dataset is None or g_valid_dataset is None:
-        raise ValueError("Global datasets not set. Run data loading first.")
-
-    try:
-        # --- 1. Suggest Hyperparameters with Safety Checks ---
-        params = suggest_safe_hyperparameters(trial)
-        
-        # Log estimated VRAM
-        _, est_vram = get_memory_safe_constraints(
-            params['d_model'], params['n_layers'], params['batch_size']
-        )
-        print(f"Trial {trial.number}: Est. VRAM {est_vram:.1f}GB | "
-              f"d={params['d_model']}, L={params['n_layers']}, B={params['batch_size']}")
-
-        # --- 2. Create DataLoaders (reuse if batch_size unchanged) ---
-        current_batch_size = params['batch_size']
-        
-        # Check if we can reuse existing loaders
-        need_new_loaders = (
-            g_train_loader is None or 
-            g_train_loader.batch_size != current_batch_size
-        )
-        
-        if need_new_loaders:
-            # Clean up old loaders if they exist
-            if g_train_loader is not None:
-                del g_train_loader, g_valid_loader
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-            
-            use_persistent = g_config.PERSISTENT_WORKERS and g_config.NUM_WORKERS > 0
-            
-            g_train_loader = DataLoader(
-                g_train_dataset,
-                batch_size=current_batch_size,
-                shuffle=True,
-                num_workers=g_config.NUM_WORKERS,
-                pin_memory=g_config.PIN_MEMORY and torch.cuda.is_available(),
-                worker_init_fn=worker_init_fn if g_config.NUM_WORKERS > 0 else None,
-                persistent_workers=use_persistent,
-                prefetch_factor=g_config.PREFETCH_FACTOR if g_config.NUM_WORKERS > 0 else None
-            )
-            
-            g_valid_loader = DataLoader(
-                g_valid_dataset,
-                batch_size=current_batch_size,
-                shuffle=False,
-                num_workers=g_config.NUM_WORKERS,
-                pin_memory=g_config.PIN_MEMORY and torch.cuda.is_available(),
-                worker_init_fn=worker_init_fn if g_config.NUM_WORKERS > 0 else None,
-                persistent_workers=use_persistent,
-                prefetch_factor=g_config.PREFETCH_FACTOR if g_config.NUM_WORKERS > 0 else None
-            )
-
-        # --- 3. Initialize Model ---
-        model_params = {
-            'in_channels': 2,
-            'seq_length': g_config.SEQ_LENGTH,
-            'num_classes': len(g_config.TARGET_MODULATIONS),
-            'd_model': params['d_model'],
-            'n_head': params['n_head'],
-            'n_layers': params['n_layers'],
-            'ffn_hidden': params['ffn_hidden'],
-            'drop_prob': params['drop_prob'],
-            'device': g_device,
-            'use_cls_token': params['use_cls_token'],
-            'embedding_type': params['embedding_type'],
-            'segment_size': params['segment_size']
-        }
-        
-        model = AMCTransformer(**model_params).to(g_device)
-
-        # --- 4. Setup Optimizer & Criterion ---
-        criterion = nn.CrossEntropyLoss(label_smoothing=params['label_smoothing'])
-        
-        if params['optimizer_name'] == "AdamW":
-            optimizer = optim.AdamW(
-                model.parameters(), 
-                lr=params['learning_rate'], 
-                weight_decay=params['weight_decay'],
-                betas=(0.9, 0.999)
-            )
-        else:
-            optimizer = optim.Adam(
-                model.parameters(), 
-                lr=params['learning_rate'], 
-                weight_decay=params['weight_decay']
-            )
-            
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=3  # More aggressive LR reduction
-        )
-        
-        # Mixed precision scaler
-        scaler = torch.amp.GradScaler('cuda') if g_config.USE_AMP and torch.cuda.is_available() else None
-        
-        early_stopping = EarlyStopping(patience=5)  # Reduced patience for tuning
-        
-        # --- 5. Training Loop ---
-        best_val_acc = 0.0
-        
-        for epoch in range(g_config.N_EPOCHS_PER_TRIAL):
-            train_loss, train_acc = train_epoch(
-                model, g_train_loader, criterion, optimizer, g_device, 
-                epoch, g_config, scaler, trial
-            )
-            
-            val_loss, val_acc = validate_epoch(
-                model, g_valid_loader, criterion, g_device, epoch, g_config, trial
-            )
-            
-            scheduler.step(val_loss)
-            
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-            
-            # Report for pruning
-            trial.report(val_acc, epoch)
-            
-            if trial.should_prune():
-                raise optuna.exceptions.TrialPruned()
-            
-            # Early stopping
-            early_stopping(val_loss, model)
-            if early_stopping.early_stop:
-                print(f"Trial {trial.number}: Early stopping at epoch {epoch+1}")
-                break
-        
-        # --- 6. Cleanup (keep dataloaders) ---
-        del model, optimizer, criterion, scheduler
-        if scaler is not None:
-            del scaler
-        
-        if torch.cuda.is_available() and g_config.EMPTY_CACHE_BETWEEN_TRIALS:
-            torch.cuda.empty_cache()
-        gc.collect()
-        
-        return best_val_acc
-
-    except optuna.exceptions.TrialPruned:
-        # Clean up before re-raising
-        if 'model' in locals():
-            del model
-        if 'optimizer' in locals():
-            del optimizer
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-        raise
-        
-    except Exception as e:
-        print(f"Error in trial {trial.number}: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Clean up on error
-        if 'model' in locals():
-            del model
-        if 'optimizer' in locals():
-            del optimizer
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-        
-        return 0.0
-
-
-# ============================================
-# OPTIMIZED OPTUNA STUDY RUNNER
-# ============================================
-
-def run_study(args, config, test_dataset, label_map, norm_stats):
-    """Create and run the Optuna study with academically rigorous configuration"""
+    global g_datasets, g_config, g_study_state, g_memory_monitor, g_adaptive_hp
     
-    config.DB_DIR.mkdir(parents=True, exist_ok=True)
-    storage_name = f"sqlite:///{config.DB_DIR}/{args.study_name}.db"
+    # Start with smallest possible configuration
+    tier_attempts = 0
+    max_tier_attempts = 5
+    current_tier = 0  # START WITH SMALLEST TIER!
     
-    print("\n" + "="*70)
-    print("🎓 ACADEMICALLY RIGOROUS HYPERPARAMETER OPTIMIZATION")
-    print("="*70)
-    print(f"Study Name: {args.study_name}")
-    print(f"Database: {storage_name}")
-    print(f"Trials: {args.n_trials}")
-    print(f"Epochs per Trial: {config.N_EPOCHS_PER_TRIAL}")
-    print("\n📊 Search Space Design:")
-    print("  Strategy: Bayesian optimization around proven configuration")
-    print("  Proven baseline: d_model=256, n_layers=9, batch=128")
-    print("\n  Hyperparameter Ranges:")
-    print("    d_model:        [128, 192, 256, 320]")
-    print("    n_layers:       [6, 7, 8, 9, 10, 11, 12]")
-    print("    n_heads:        [8, 16]")
-    print("    batch_size:     [64, 96, 128, 160] (adaptive)")
-    print("    learning_rate:  [5e-5, 3e-4] (log-scale)")
-    print("    dropout:        [0.05, 0.25]")
-    print("    embedding_type: ['segment', 'conv1d']")
-    print("\n  Optimization:")
-    print("    - TPE (Tree-structured Parzen Estimator) sampler")
-    print("    - MedianPruner for early stopping of unpromising trials")
-    print("    - Mixed precision training (AMP) enabled")
-    print(f"    - Workers: {config.NUM_WORKERS}")
-    print("="*70)
-    
-    study = optuna.create_study(
-        study_name=args.study_name,
-        storage=InMemoryStorage(),
-        direction="maximize",
-        pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=config.PRUNE_STARTUP_TRIALS,
-            n_warmup_steps=config.PRUNE_WARMUP_STEPS
-        ),
-        sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=10),
-        load_if_exists=False
-    )
-    
-    # === INFORM OPTUNA WITH PROVEN CONFIGURATION ===
-    # This helps Optuna start from a known-good configuration
-    # rather than exploring randomly at first
-    print("\n🎯 Informing optimizer with proven baseline configuration...")
-    try:
-        study.enqueue_trial({
-            'embedding_type': 'segment',
-            'segment_size': 16,
-            'd_model': 256,
-            'n_head': 16,
-            'n_layers': 9,
-            'ffn_multiplier': 2,  # 512 / 256 = 2
-            'drop_prob': 0.1,
-            'use_cls_token': True,
-            'batch_size': 128,
-            'learning_rate': 1e-4,
-            'weight_decay': 1e-3,
-            'optimizer': 'AdamW',
-            'label_smoothing': 0.1
-        })
-        print("✅ Baseline configuration enqueued as Trial 0")
-    except Exception as e:
-        print(f"⚠️  Could not enqueue baseline: {e}")
-        print("   Continuing with random exploration...")
-    
-    def memory_callback(study, trial):
-        """Callback to manage memory between trials"""
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, 'reset_peak_memory_stats'):
-                torch.cuda.reset_peak_memory_stats()
-    
-    start_time = time.time()
-    
-    try:
-        study.optimize(
-            objective,
-            n_trials=args.n_trials,
-            timeout=None,
-            catch=(Exception,),
-            callbacks=[memory_callback],
-            gc_after_trial=True,
-            show_progress_bar=True
-        )
-    except KeyboardInterrupt:
-        print("\n\n⚠️ Study interrupted by user!")
-    
-    elapsed_time = time.time() - start_time
-    
-    print("\n" + "="*70)
-    print("✅ STUDY COMPLETE!")
-    print("="*70)
-    print(f"Total time: {elapsed_time/3600:.2f} hours")
-    print(f"Completed trials: {len(study.trials)}")
-    print(f"Pruned trials: {len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])}")
-    print(f"Failed trials: {len([t for t in study.trials if t.state == optuna.trial.TrialState.FAIL])}")
-    print(f"\nBest trial: #{study.best_trial.number}")
-    print(f"Best validation accuracy: {study.best_value:.4f}")
-    print("\nBest hyperparameters:")
-    for key, value in study.best_params.items():
-        print(f"  {key}: {value}")
-    
-    # Check memory estimate for best trial
-    _, est_vram = get_memory_safe_constraints(
-        study.best_params['d_model'],
-        study.best_params['n_layers'],
-        study.best_params['batch_size']
-    )
-    print(f"\nEstimated VRAM for best model: {est_vram:.1f} GB")
-        
-    # Final evaluation with best model
-    print("\n" + "="*70)
-    print("EVALUATING BEST MODEL ON TEST SET")
-    print("="*70)
-    
-    best_params = study.best_params
-    
-    model_params = {
-        'in_channels': 2,
-        'seq_length': config.SEQ_LENGTH,
-        'num_classes': len(config.TARGET_MODULATIONS),
-        'd_model': best_params['d_model'],
-        'n_head': best_params['n_head'],
-        'n_layers': best_params['n_layers'],
-        'ffn_hidden': best_params['d_model'] * best_params['ffn_multiplier'],
-        'drop_prob': best_params['drop_prob'],
-        'device': config.DEVICE,
-        'use_cls_token': best_params['use_cls_token'],
-        'embedding_type': best_params['embedding_type'],
-        'segment_size': best_params.get('segment_size')
-    }
-    
-    best_model = AMCTransformer(**model_params).to(config.DEVICE)
-    
-    use_persistent = config.PERSISTENT_WORKERS and config.NUM_WORKERS > 0
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=min(best_params['batch_size'], 64),
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=config.PIN_MEMORY and torch.cuda.is_available(),
-        worker_init_fn=worker_init_fn if config.NUM_WORKERS > 0 else None,
-        persistent_workers=use_persistent,
-        prefetch_factor=config.PREFETCH_FACTOR if config.NUM_WORKERS > 0 else None
-    )
-    
-    print(f"Test set: {len(test_loader):,} batches ({len(test_dataset):,} samples)")
-    
-    eval_dir = config.LOG_DIR / f"study_{args.study_name}_best_eval"
-    eval_results = evaluate_model_with_confusion(
-        model=best_model,
-        dataloader=test_loader,
-        device=config.DEVICE,
-        class_names=config.TARGET_MODULATIONS,
-        save_dir=eval_dir,
-        prefix='best_trial_test'
-    )
-    
-    print(f"\n✅ Best Model Test Accuracy: {eval_results.get('accuracy', 'N/A')}")
-    
-    # Save study results
-    results_path = eval_dir / "study_results.json"
-    results = {
-        'best_trial': study.best_trial.number,
-        'best_value': study.best_value,
-        'best_params': study.best_params,
-        'n_trials': len(study.trials),
-        'pruned_trials': len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]),
-        'failed_trials': len([t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]),
-        'total_time_hours': elapsed_time / 3600,
-        'estimated_vram_gb': est_vram,
-        'test_accuracy': eval_results.get('accuracy')
-    }
-    
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=4)
-    print(f"\nStudy results saved to: {results_path}")
-    
-    # Clean up
-    del best_model, test_loader
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
-# ============================================
-# OPTIMIZED SINGLE TRAINING
-# ============================================
-
-def run_single_training(config, args, experiment_name, exp_checkpoint_dir,
-                        train_dataset, valid_dataset, test_indices, label_map, norm_stats):
-    """Run a single training loop optimized for 16GB VRAM"""
-    
-    print("\n" + "="*70)
-    print("🚀 STARTING OPTIMIZED SINGLE TRAINING RUN")
-    print("="*70)
-
-    # --- Create dataloaders ---
-    print("Creating dataloaders...")
-    use_persistent = config.PERSISTENT_WORKERS and config.NUM_WORKERS > 0
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=True,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=config.PIN_MEMORY and torch.cuda.is_available(),
-        worker_init_fn=worker_init_fn if config.NUM_WORKERS > 0 else None,
-        persistent_workers=use_persistent,
-        prefetch_factor=config.PREFETCH_FACTOR if config.NUM_WORKERS > 0 else None
-    )
-    
-    valid_loader = DataLoader(
-        valid_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=config.PIN_MEMORY and torch.cuda.is_available(),
-        worker_init_fn=worker_init_fn if config.NUM_WORKERS > 0 else None,
-        persistent_workers=use_persistent,
-        prefetch_factor=config.PREFETCH_FACTOR if config.NUM_WORKERS > 0 else None
-    )
-    
-    print(f"✅ Data loaded:")
-    print(f"   Train: {len(train_loader):,} batches ({len(train_dataset):,} samples)")
-    print(f"   Valid: {len(valid_loader):,} batches ({len(valid_dataset):,} samples)")
-    print(f"   Workers: {config.NUM_WORKERS}, Prefetch: {config.PREFETCH_FACTOR}")
-    print(f"   Mixed Precision: {'Enabled' if config.USE_AMP else 'Disabled'}")
-    
-    # --- Model Setup ---
-    print("\n🤖 Initializing model...")
-    
-    model_params = {
-        'in_channels': 2,
-        'seq_length': config.SEQ_LENGTH,
-        'num_classes': len(config.TARGET_MODULATIONS),
-        'd_model': config.D_MODEL,
-        'n_head': config.N_HEAD,
-        'n_layers': config.N_LAYERS,
-        'ffn_hidden': config.FFN_HIDDEN,
-        'drop_prob': config.DROP_PROB,
-        'device': config.DEVICE,
-        'use_cls_token': config.USE_CLS_TOKEN,
-        'embedding_type': config.EMBEDDING_TYPE,
-        'segment_size': config.SEGMENT_SIZE
-    }
-    
-    model = AMCTransformer(**model_params).to(config.DEVICE)
-    
-    num_params = sum(p.numel() for p in model.parameters())
-    num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    print(f"✅ Model created:")
-    print(f"   Total parameters: {num_params:,}")
-    print(f"   Trainable parameters: {num_trainable:,}")
-    
-    # Estimate and check memory
-    _, est_vram = get_memory_safe_constraints(
-        config.D_MODEL, config.N_LAYERS, config.BATCH_SIZE
-    )
-    print(f"   Estimated VRAM: {est_vram:.1f} GB")
-    
-    if torch.cuda.is_available():
-        memory_allocated = torch.cuda.memory_allocated() / 1024**3
-        print(f"   GPU Memory allocated: {memory_allocated:.2f} GB")
-    
-    # --- Optimizer & Criterion ---
-    criterion = nn.CrossEntropyLoss(label_smoothing=config.LABEL_SMOOTHING)
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config.LEARNING_RATE,
-        weight_decay=config.WEIGHT_DECAY,
-        betas=(0.9, 0.999)
-    )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
-    )
-    scaler = torch.amp.GradScaler('cuda') if config.USE_AMP and torch.cuda.is_available() else None
-    early_stopping = EarlyStopping(patience=config.PATIENCE)
-    
-    # --- Resume from Checkpoint ---
-    start_epoch = 0
-    history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
-    
-    if args.resume:
-        print(f"\n📥 Resuming from checkpoint: {args.resume}")
+    while tier_attempts < max_tier_attempts:
         try:
-            checkpoint = load_checkpoint(args.resume, model, optimizer, scheduler)
-            start_epoch = checkpoint['epoch'] + 1
-            history = checkpoint.get('history', history)
-            if scaler is not None and 'scaler' in checkpoint:
-                scaler.load_state_dict(checkpoint['scaler'])
-            print(f"   ✅ Resuming from epoch {start_epoch}")
-        except Exception as e:
-            print(f"   ⚠️  Failed to load checkpoint: {e}")
-            print("   Starting training from scratch...")
-    
-    # --- Training Loop ---
-    print("\n" + "="*70)
-    print("STARTING TRAINING")
-    print("="*70)
-    
-    training_start_time = time.time()
-    
-    for epoch in range(start_epoch, config.NUM_EPOCHS):
-        epoch_start_time = time.time()
-        
-        train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, config.DEVICE, 
-            epoch, config, scaler
-        )
-        
-        val_loss, val_acc = validate_epoch(
-            model, valid_loader, criterion, config.DEVICE, epoch, config
-        )
-        
-        scheduler.step(val_loss)
-        
-        history['train_loss'].append(train_loss)
-        history['train_acc'].append(train_acc)
-        history['val_loss'].append(val_loss)
-        history['val_acc'].append(val_acc)
-        
-        epoch_time = time.time() - epoch_start_time
-        current_lr = get_lr(optimizer)
-        
-        # Memory info
-        memory_info = ""
-        if torch.cuda.is_available():
-            memory_allocated = torch.cuda.memory_allocated() / 1024**3
-            memory_cached = torch.cuda.memory_reserved() / 1024**3
-            memory_info = f" | GPU: {memory_allocated:.1f}/{memory_cached:.1f}GB"
-        
-        print(f"\nEpoch {epoch+1}/{config.NUM_EPOCHS} Summary:")
-        print(f"   Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
-        print(f"   Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
-        print(f"   Time: {epoch_time:.1f}s | LR: {current_lr:.2e}{memory_info}")
-        
-        # Save checkpoint
-        if (epoch + 1) % config.SAVE_FREQ == 0 or (epoch + 1) == config.NUM_EPOCHS:
-            checkpoint_path = exp_checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pth"
-            checkpoint_dict = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'val_loss': val_loss,
-                'history': history,
-                'config': get_config_dict(config)
-            }
-            if scaler is not None:
-                checkpoint_dict['scaler'] = scaler.state_dict()
+            # Clear memory before starting
+            g_memory_monitor.clear_memory()
+            torch.cuda.synchronize()
             
-            torch.save(checkpoint_dict, checkpoint_path)
-            print(f"   💾 Checkpoint saved: {checkpoint_path.name}")
-        
-        # Early stopping
-        early_stopping(val_loss, model)
-        
-        if early_stopping.early_stop:
-            print("\n⏹️  Early stopping triggered!")
-            final_path = exp_checkpoint_dir / "model_best.pth"
-            checkpoint_dict = {
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'val_loss': early_stopping.best_score,
-                'history': history,
-                'config': get_config_dict(config)
-            }
-            if scaler is not None:
-                checkpoint_dict['scaler'] = scaler.state_dict()
-            torch.save(checkpoint_dict, final_path)
-            print(f"   💾 Best model saved: {final_path}")
-            break
-        
-        print("-" * 70)
+            # Get hyperparameters for current tier
+            params = g_adaptive_hp.suggest_with_fallback(trial, forced_tier=current_tier)
+            
+            # Start with even smaller batch if previous attempts failed
+            if tier_attempts > 0:
+                params['batch_size'] = max(8, params['batch_size'] // (2 ** tier_attempts))
+            
+            print(f"\nTrial {trial.number} Attempt {tier_attempts+1}:")
+            print(f"  Tier: {params['tier_name']}")
+            print(f"  Config: d={params['d_model']}, L={params['n_layers']}, B={params['batch_size']}")
+            print(f"  Est. VRAM: {params['estimated_vram']:.1f}GB")
+            
+            # Try to create model
+            try:
+                model = AMCTransformer(
+                    in_channels=2,
+                    seq_length=g_config.SEQ_LENGTH,
+                    num_classes=len(g_config.TARGET_MODULATIONS),
+                    d_model=params['d_model'],
+                    n_head=params['n_head'],
+                    n_layers=params['n_layers'],
+                    ffn_hidden=params['d_model'] * params['ffn_multiplier'],
+                    drop_prob=params['drop_prob'],
+                    device=g_config.DEVICE,
+                    use_cls_token=params['use_cls_token'],
+                    embedding_type=params['embedding_type'],
+                    segment_size=params['segment_size']
+                ).to(g_config.DEVICE)
+            except torch.cuda.OutOfMemoryError:
+                print(f"  ❌ OOM creating model! Reducing tier...")
+                tier_attempts += 1
+                continue
+            
+            # Setup training
+            criterion = nn.CrossEntropyLoss(label_smoothing=params['label_smoothing'])
+            
+            if params['optimizer_name'] == "AdamW":
+                optimizer = optim.AdamW(
+                    model.parameters(),
+                    lr=params['learning_rate'],
+                    weight_decay=params['weight_decay']
+                )
+            else:
+                optimizer = optim.Adam(
+                    model.parameters(),
+                    lr=params['learning_rate'],
+                    weight_decay=params['weight_decay']
+                )
+            
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=3
+            )
+            
+            scaler = torch.amp.GradScaler('cuda') if g_config.USE_AMP else None
+            early_stopping = EarlyStopping(patience=g_config.PATIENCE_PER_TRIAL)
+            
+            best_val_acc = 0.0
+            best_model_state = None
+            current_batch_size = params['batch_size']
+            
+            # Training loop
+            epoch_oom_count = 0
+            for epoch in range(g_config.N_EPOCHS_PER_TRIAL):
+                # Create fresh dataloaders each epoch
+                train_loader = DataLoader(
+                    g_datasets['train'],
+                    batch_size=current_batch_size,
+                    shuffle=True,
+                    num_workers=g_config.NUM_WORKERS,
+                    pin_memory=False,
+                    worker_init_fn=worker_init_fn
+                )
+                
+                valid_loader = DataLoader(
+                    g_datasets['valid'],
+                    batch_size=min(current_batch_size, 16),
+                    shuffle=False,
+                    num_workers=g_config.NUM_WORKERS,
+                    pin_memory=False,
+                    worker_init_fn=worker_init_fn
+                )
+                
+                try:
+                    # Try training
+                    train_loss, train_acc = train_one_epoch(
+                        model, train_loader, criterion, optimizer,
+                        g_config.DEVICE, epoch, g_config, scaler, trial
+                    )
+                    
+                    val_loss, val_acc = validate_epoch(
+                        model, valid_loader, criterion,
+                        g_config.DEVICE, epoch, g_config, trial
+                    )
+                    
+                    scheduler.step(val_loss)
+                    
+                    # Success! Reset OOM counter
+                    epoch_oom_count = 0
+                    
+                    # Track best
+                    if val_acc > best_val_acc:
+                        best_val_acc = val_acc
+                        best_model_state = model.state_dict().copy()
+                    
+                    # Report
+                    trial.report(val_acc, epoch)
+                    if trial.should_prune():
+                        raise optuna.exceptions.TrialPruned()
+                    
+                    # Early stopping
+                    early_stopping(val_loss, model)
+                    if early_stopping.early_stop:
+                        print(f"  Early stopping at epoch {epoch+1}")
+                        break
+                        
+                except torch.cuda.OutOfMemoryError:
+                    epoch_oom_count += 1
+                    print(f"  ❌ OOM at epoch {epoch+1}!")
+                    
+                    # Clean up
+                    del train_loader, valid_loader
+                    g_memory_monitor.clear_memory()
+                    torch.cuda.synchronize()
+                    
+                    # Reduce batch size
+                    new_batch_size = max(1, current_batch_size // 2)
+                    if new_batch_size < current_batch_size:
+                        current_batch_size = new_batch_size
+                        print(f"  📉 Reducing batch size to {current_batch_size}")
+                    else:
+                        # Can't reduce further, need smaller model
+                        raise torch.cuda.OutOfMemoryError("Cannot reduce batch size further")
+            
+            # If we got here, training succeeded!
+            if best_model_state is not None:
+                g_study_state.save_trial_checkpoint(
+                    trial.number,
+                    best_model_state,
+                    params,
+                    {'best_val_acc': best_val_acc, 'final_batch_size': current_batch_size}
+                )
+                print(f"  ✅ Completed with {best_val_acc:.2f}%")
+            
+            # Cleanup
+            del model, optimizer, criterion, scheduler
+            g_memory_monitor.clear_memory()
+            gc.collect()
+            
+            return best_val_acc
+            
+        except torch.cuda.OutOfMemoryError:
+            print(f"  ❌ OOM with tier {current_tier}. Trying smaller configuration...")
+            
+            # Cleanup everything
+            if 'model' in locals(): del model
+            if 'optimizer' in locals(): del optimizer
+            if 'train_loader' in locals(): del train_loader
+            if 'valid_loader' in locals(): del valid_loader
+            
+            g_memory_monitor.clear_memory()
+            torch.cuda.synchronize()
+            gc.collect()
+            time.sleep(2)
+            
+            tier_attempts += 1
+            continue
+            
+        except optuna.exceptions.TrialPruned:
+            raise
+            
+        except Exception as e:
+            print(f"  ❌ Error: {e}")
+            tier_attempts += 1
+            continue
     
-    # --- Training Complete ---
-    total_training_time = time.time() - training_start_time
-    
-    print("\n" + "="*70)
-    print("TRAINING COMPLETE!")
-    print("="*70)
-    print(f"Total time: {total_training_time/3600:.2f} hours")
-    print(f"Best val loss: {early_stopping.best_score:.4f}")
-    
-    if not early_stopping.early_stop:
-        final_path = exp_checkpoint_dir / "model_final.pth"
-        checkpoint_dict = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'val_loss': val_loss,
-            'history': history,
-            'config': get_config_dict(config)
-        }
-        if scaler is not None:
-            checkpoint_dict['scaler'] = scaler.state_dict()
-        torch.save(checkpoint_dict, final_path)
-        print(f"Final model saved: {final_path}")
+    print(f"  ❌ Failed after {max_tier_attempts} attempts. Pruning trial.")
+    raise optuna.exceptions.TrialPruned()
 
-    plot_path = config.LOG_DIR / f"{experiment_name}_training_history.png"
-    plot_training_history(history, save_path=plot_path)
-    print(f"Training history plot saved: {plot_path}")
+# ============================================
+# MAIN STUDY RUNNER - UPDATED
+# ============================================
+
+def run_optuna_study(args, config):
+    """Run Optuna study with memory management - UPDATED VERSION"""
     
-    # --- Final Evaluation ---
+    global g_datasets, g_config, g_study_state, g_memory_monitor, g_adaptive_hp
+    g_config = config
+    
+    # Initialize memory monitor
+    g_memory_monitor = MemoryMonitor(vram_threshold=0.85, ram_threshold=0.80)
+    
+    # Setup directories
+    config.STUDY_DIR.mkdir(parents=True, exist_ok=True)
+    study_name = args.study_name or f"amc_study_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    study_dir = config.STUDY_DIR / study_name
+    study_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize study state
+    g_study_state = StudyState(study_dir)
+    
+    # Initialize adaptive hyperparameters
+    g_adaptive_hp = AdaptiveHyperparameters(g_memory_monitor, config)
+    
+    # Database for persistence
+    db_path = study_dir / f"{study_name}.db"
+    storage = RDBStorage(f"sqlite:///{db_path}")
+    
     print("\n" + "="*70)
-    print("EVALUATING ON TEST SET")
+    print("OPTUNA HYPERPARAMETER TUNING WITH STRATIFIED SAMPLING - FIXED")
     print("="*70)
+    print(f"Study: {study_name}")
+    print(f"Database: {db_path}")
+    print(f"Target trials: {args.n_trials}")
+    print(f"Epochs per trial: {config.N_EPOCHS_PER_TRIAL}")
     
-    best_model_path = exp_checkpoint_dir / "model_best.pth"
-    if not best_model_path.exists():
-        best_model_path = exp_checkpoint_dir / "model_final.pth"
+    # Memory status
+    print("\n📊 System Resources:")
+    g_memory_monitor.print_status("  ")
+    print(f"  VRAM Safety Margin: {config.VRAM_SAFETY_MARGIN}GB")
+    print(f"  Memory Fallback: {'Enabled' if config.ENABLE_MEMORY_FALLBACK else 'Disabled'}")
     
-    print(f"Loading model from: {best_model_path}")
-    checkpoint = torch.load(best_model_path, map_location=config.DEVICE)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Load data with stratified sampling - USING FIXED VERSION
+    print("\n📂 Loading datasets with stratified sampling...")
+    
+    # Perform stratified split using the FIXED function
+    train_indices, valid_indices, test_indices, label_map = stratified_split_data(
+        str(config.FILE_PATH),
+        str(config.JSON_PATH),
+        config.TARGET_MODULATIONS,
+        config.TRAIN_SIZE,
+        config.VALID_SIZE,
+        config.TEST_SIZE,
+        config.SPLIT_SEED
+    )
+    
+    # For fast tuning, create stratified subsets
+    if args.fast_tuning:
+        print("\n⚡ Fast tuning mode: Using 10% stratified subsets")
+        
+        # Get the full labels and SNRs for sampling
+        all_indices, Y_strings, Z_values = get_dataset_labels_and_snrs(
+            str(config.FILE_PATH),
+            str(config.JSON_PATH),
+            config.TARGET_MODULATIONS
+        )
+        
+        train_subset = stratified_sampling(
+            train_indices, Y_strings, Z_values, config.TARGET_MODULATIONS, 
+            ratio=0.1, seed=42
+        )
+        valid_subset = stratified_sampling(
+            valid_indices, Y_strings, Z_values, config.TARGET_MODULATIONS,
+            ratio=0.1, seed=43
+        )
+        
+        train_indices = train_subset
+        valid_indices = valid_subset
+        
+        print(f"   Train subset: {len(train_indices):,} samples")
+        print(f"   Valid subset: {len(valid_indices):,} samples")
+    
+    # Create datasets
+    train_dataset = SingleStreamImageDataset(
+        file_path=str(config.FILE_PATH),
+        json_path=str(config.JSON_PATH),
+        target_modulations=config.TARGET_MODULATIONS,
+        mode='train',
+        indices=train_indices,
+        label_map=label_map,
+        seed=config.NORM_SEED
+    )
+    
+    norm_stats = train_dataset.get_normalization_stats()
+    
+    valid_dataset = SingleStreamImageDataset(
+        file_path=str(config.FILE_PATH),
+        json_path=str(config.JSON_PATH),
+        target_modulations=config.TARGET_MODULATIONS,
+        mode='valid',
+        indices=valid_indices,
+        label_map=label_map,
+        normalization_stats=norm_stats
+    )
     
     test_dataset = SingleStreamImageDataset(
         file_path=str(config.FILE_PATH),
@@ -1124,164 +968,161 @@ def run_single_training(config, args, experiment_name, exp_checkpoint_dir,
         normalization_stats=norm_stats
     )
     
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=config.PIN_MEMORY and torch.cuda.is_available(),
-        worker_init_fn=worker_init_fn if config.NUM_WORKERS > 0 else None,
-        persistent_workers=use_persistent,
-        prefetch_factor=config.PREFETCH_FACTOR if config.NUM_WORKERS > 0 else None
-    )
+    g_datasets = {
+        'train': train_dataset,
+        'valid': valid_dataset,
+        'test': test_dataset
+    }
     
-    print(f"Test set: {len(test_loader):,} batches ({len(test_dataset):,} samples)")
+    print(f"\n✅ Datasets loaded:")
+    print(f"   Train: {len(train_dataset):,} samples")
+    print(f"   Valid: {len(valid_dataset):,} samples")
+    print(f"   Test: {len(test_dataset):,} samples")
     
-    eval_results = evaluate_model_with_confusion(
-        model=model,
-        dataloader=test_loader,
-        device=config.DEVICE,
-        class_names=config.TARGET_MODULATIONS,
-        save_dir=exp_checkpoint_dir / "evaluation",
-        prefix='test'
-    )
+    # Memory after loading
+    g_memory_monitor.print_status("  After loading - ")
     
-    print(f"\n✅ Test Accuracy: {eval_results.get('accuracy', 'N/A')}")
-    return test_dataset
-
+    # Create or load study
+    try:
+        study = optuna.load_study(
+            study_name=study_name,
+            storage=storage
+        )
+        n_previous_trials = len(study.trials)
+        print(f"\n✅ Resuming study with {n_previous_trials} completed trials")
+    except:
+        study = optuna.create_study(
+            study_name=study_name,
+            storage=storage,
+            direction="maximize",
+            pruner=optuna.pruners.MedianPruner(
+                n_startup_trials=config.PRUNE_STARTUP_TRIALS,
+                n_warmup_steps=config.PRUNE_WARMUP_STEPS
+            ),
+            sampler=optuna.samplers.TPESampler(seed=42)
+        )
+        n_previous_trials = 0
+        print("\n✅ Created new study")
+    
+    # Run optimization
+    remaining_trials = max(0, args.n_trials - n_previous_trials)
+    if remaining_trials == 0:
+        print(f"\n✅ Study already completed {args.n_trials} trials")
+    else:
+        print(f"\n🚀 Running {remaining_trials} more trials...")
+        
+        def callback(study, trial):
+            """Callback after each trial"""
+            g_study_state.save({
+                'best_value': study.best_value if study.best_trial else None,
+                'best_params': study.best_params if study.best_trial else None,
+                'best_trial_number': study.best_trial.number if study.best_trial else None,
+                'n_trials': len(study.trials),
+                'tier_history': g_adaptive_hp.tier_history,
+                'timestamp': datetime.now().isoformat()
+            })
+            
+            g_memory_monitor.clear_memory()
+            gc.collect()
+        
+        start_time = time.time()
+        
+        try:
+            study.optimize(
+                objective_with_fallback,
+                n_trials=remaining_trials,
+                callbacks=[callback],
+                gc_after_trial=True,
+                show_progress_bar=True
+            )
+        except KeyboardInterrupt:
+            print("\n⚠️ Study interrupted! Progress saved.")
+        
+        elapsed = time.time() - start_time
+        print(f"\n✅ Session complete! Time: {elapsed/3600:.2f} hours")
+    
+    # Final evaluation and reporting
+    if study.best_trial:
+        print("\n" + "="*70)
+        print("BEST TRIAL RESULTS")
+        print("="*70)
+        print(f"Trial #{study.best_trial.number}")
+        print(f"Accuracy: {study.best_value:.4f}")
+        print("\nParameters:")
+        for key, value in study.best_params.items():
+            print(f"  {key}: {value}")
+    
+    # Cleanup
+    for dataset in g_datasets.values():
+        dataset.close()
+    
+    print("\n✅ Study complete!")
 
 # ============================================
-# MAIN ROUTER
+# MAIN ENTRY POINT
 # ============================================
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='AMC Transformer Hyperparameter Tuning with Memory Management',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    parser.add_argument('--study_name', type=str, help='Study name (for resuming)')
+    parser.add_argument('--n_trials', type=int, default=50, help='Total number of trials')
+    parser.add_argument('--epochs_per_trial', type=int, default=50, help='Epochs per trial')
+    parser.add_argument('--num_workers', type=int, default=4, help='DataLoader workers')
+    parser.add_argument('--no_amp', action='store_true', help='Disable mixed precision')
+    parser.add_argument('--no_fallback', action='store_true', help='Disable memory fallback')
+    parser.add_argument('--fast_tuning', action='store_true', help='Use 10% subsets for faster tuning')
+    
+    return parser.parse_args()
 
 def main():
-    """Main function to route to single run or Optuna study"""
-    
-    config = None
-    experiment_name = None
-    exp_checkpoint_dir = None
-    
+    """Main entry point"""
     try:
-        # --- 1. Initial Setup ---
         args = parse_args()
-        config = Config.from_args(args)
         
-        config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        config.LOG_DIR.mkdir(parents=True, exist_ok=True)
-        
-        experiment_name = args.experiment_name or f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        exp_checkpoint_dir = config.CHECKPOINT_DIR / experiment_name
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        
+        # Setup environment
         os.environ['HDF5_USE_FILE_LOCKING'] = 'FALSE'
         
-        # PyTorch optimizations
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
             torch.backends.cudnn.benchmark = True
-            # Additional: enable cudnn autotuner
             torch.backends.cudnn.enabled = True
         
+        # Configure
+        config = Config()
+        config.N_TRIALS = args.n_trials
+        config.N_EPOCHS_PER_TRIAL = args.epochs_per_trial
+        config.NUM_WORKERS = args.num_workers
+        config.USE_AMP = not args.no_amp
+        config.ENABLE_MEMORY_FALLBACK = not args.no_fallback
+        
         print("="*70)
-        print("AMC TRANSFORMER - OPTIMIZED FOR 16GB VRAM")
+        print("AMC TRANSFORMER HYPERPARAMETER TUNING WITH STRATIFIED SAMPLING - FIXED")
         print("="*70)
-        print(f"Mode: {'TUNING' if args.tune else 'SINGLE RUN'}")
         print(f"Device: {config.DEVICE}")
         if torch.cuda.is_available():
             print(f"GPU: {torch.cuda.get_device_name()}")
-            total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
-            print(f"GPU Memory: {total_memory:.1f} GB")
-            print(f"Target Utilization: 80-85% (~{total_memory * 0.825:.1f} GB)")
+            print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        print(f"Fast tuning: {args.fast_tuning}")
         
-        # --- 2. Load Data ---
-        print("\n📂 Loading data...")
+        # Run study
+        run_optuna_study(args, config)
         
-        train_indices, valid_indices, test_indices, label_map = split_data(
-            str(config.FILE_PATH), str(config.JSON_PATH), config.TARGET_MODULATIONS,
-            config.TRAIN_SIZE, config.VALID_SIZE, config.TEST_SIZE, config.SPLIT_SEED
-        )
+        print("\n✅ Complete!")
         
-        print("Creating datasets...")
-        train_dataset = SingleStreamImageDataset(
-            file_path=str(config.FILE_PATH),
-            json_path=str(config.JSON_PATH),
-            target_modulations=config.TARGET_MODULATIONS,
-            mode='train',
-            indices=train_indices,
-            label_map=label_map,
-            seed=config.NORM_SEED
-        )
-        
-        norm_stats = train_dataset.get_normalization_stats()
-        print(f"Normalization stats: I μ={norm_stats['i_mean']:.4f}, σ={norm_stats['i_std']:.4f} | "
-              f"Q μ={norm_stats['q_mean']:.4f}, σ={norm_stats['q_std']:.4f}")
-
-        valid_dataset = SingleStreamImageDataset(
-            file_path=str(config.FILE_PATH),
-            json_path=str(config.JSON_PATH),
-            target_modulations=config.TARGET_MODULATIONS,
-            mode='valid',
-            indices=valid_indices,
-            label_map=label_map,
-            normalization_stats=norm_stats
-        )
-        
-        # --- 3. Route to Tuning or Single Run ---
-        if args.tune:
-            global g_train_dataset, g_valid_dataset, g_config, g_device
-            g_train_dataset = train_dataset
-            g_valid_dataset = valid_dataset
-            g_config = config
-            g_device = config.DEVICE
-            
-            test_dataset = SingleStreamImageDataset(
-                file_path=str(config.FILE_PATH),
-                json_path=str(config.JSON_PATH),
-                target_modulations=config.TARGET_MODULATIONS,
-                mode='test',
-                indices=test_indices,
-                label_map=label_map,
-                normalization_stats=norm_stats
-            )
-            
-            run_study(args, config, test_dataset, label_map, norm_stats)
-            
-        else:
-            test_dataset = run_single_training(
-                config, args, experiment_name, exp_checkpoint_dir,
-                train_dataset, valid_dataset, test_indices,
-                label_map, norm_stats
-            )
-
-        # --- 4. Cleanup ---
-        print("\nCleaning up datasets...")
-        train_dataset.close()
-        valid_dataset.close()
-        if 'test_dataset' in locals():
-            test_dataset.close()
-        
-        # Final cleanup
-        global g_train_loader, g_valid_loader
-        if g_train_loader is not None:
-            del g_train_loader, g_valid_loader
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        gc.collect()
-        
-        print("\n✅ All done!")
-
     except KeyboardInterrupt:
-        print("\n\n⚠️ Process interrupted by user!")
-        sys.exit(1)
-        
+        print("\n\n⚠️ Interrupted by user")
+        sys.exit(0)
     except Exception as e:
-        print(f"\n\n❌ An unexpected error occurred: {e}")
+        print(f"\n❌ Error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == '__main__':
     main()
